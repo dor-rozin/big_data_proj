@@ -1,0 +1,4 @@
+streamlit==1.36.0
+elasticsearch==8.13.1
+pandas==2.2.2
+plotly==5.22.0
