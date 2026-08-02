@@ -1,0 +1,99 @@
+# Big Data & AI course project
+# Pipeline: yfinance -> Kafka -> Spark (transform + MLlib) -> Elasticsearch -> Streamlit
+#
+# Usage:
+#   docker compose up -d kafka elasticsearch     # start infrastructure
+#   docker compose run --rm producer             # pull yfinance data into Kafka
+#   docker compose run --rm spark                # transform + anomaly detection + load ES
+#   docker compose up -d dashboard               # start the Streamlit dashboard (http://localhost:8501)
+
+services:
+  # ---------------------------------------------------------------------------
+  # Kafka in KRaft mode (no ZooKeeper -> lighter on RAM). Single-node broker.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    ports:
+      - "9092:9092"          # host access (localhost:9092)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch single node. Security disabled for a local demo.
+  # Heap capped at 512m to stay within an 8 GB Docker allocation.
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ---------------------------------------------------------------------------
+  # Producer: pulls prices + news from yfinance and publishes JSON to Kafka.
+  # Run on demand (docker compose run --rm producer), not a long-running service.
+  # ---------------------------------------------------------------------------
+  producer:
+    build: ./producer
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    env_file: .env
+
+  # ---------------------------------------------------------------------------
+  # Spark pipeline: reads Kafka -> features + KMeans anomaly detection +
+  # VADER sentiment -> writes to Elasticsearch. Run on demand.
+  # ---------------------------------------------------------------------------
+  spark:
+    build: ./spark
+    container_name: spark
+    depends_on:
+      kafka:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - spark-ivy:/root/.ivy2   # cache the downloaded Kafka connector jar between runs
+
+  # ---------------------------------------------------------------------------
+  # Streamlit dashboard: reads Elasticsearch and shows the findings.
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    env_file: .env
+    ports:
+      - "8501:8501"
+
+volumes:
+  spark-ivy:
