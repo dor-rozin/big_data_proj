@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dor-rozin/big_data_proj/schemas/sec.filings.v1.schema.json",
+  "title": "sec.filings.v1",
+  "description": "One SEC filing with a closed set of normalised XBRL facts. Kafka message key is the CIK.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "cik",
+    "ticker",
+    "accession_no",
+    "form_type",
+    "filed_date",
+    "fiscal_period",
+    "period_start",
+    "period_end",
+    "facts",
+    "ingested_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Contract version. Bumping this means a new topic, not a new value here.",
+      "type": "integer",
+      "const": 1
+    },
+    "cik": {
+      "description": "SEC Central Index Key, zero-padded to exactly 10 digits.",
+      "type": "string",
+      "pattern": "^[0-9]{10}$"
+    },
+    "ticker": {
+      "description": "Uppercase ticker. Null when the CIK maps to no listed ticker.",
+      "type": ["string", "null"],
+      "pattern": "^[A-Z][A-Z.]*$",
+      "minLength": 1,
+      "maxLength": 12
+    },
+    "accession_no": {
+      "description": "SEC accession number in dashed form, e.g. 0000320193-23-000106. Unique per filing.",
+      "type": "string",
+      "pattern": "^[0-9]{10}-[0-9]{2}-[0-9]{6}$"
+    },
+    "form_type": {
+      "description": "Filing form type, e.g. 10-K, 10-Q, 10-K/A, 8-K. Not filtered: some 8-Ks carry full financials.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20
+    },
+    "filed_date": {
+      "description": "Date the SEC accepted the filing, YYYY-MM-DD. Use max(filed_date) to resolve amendments.",
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "fiscal_period": {
+      "description": "Period the duration facts cover: FY for annual (~365d), Q1-Q4 for a discrete quarter (~91d, NOT year-to-date). Without this, an annual revenue and a quarterly revenue are indistinguishable.",
+      "type": "string",
+      "enum": ["FY", "Q1", "Q2", "Q3", "Q4"]
+    },
+    "period_start": {
+      "description": "First day of the reported period, YYYY-MM-DD. Applies to duration facts only (income statement, cash flow). Null when the filing reports no duration facts. Not derivable from period_end: fiscal years are 52/53 weeks for many issuers.",
+      "type": ["string", "null"],
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "period_end": {
+      "description": "Last day of the reported period, YYYY-MM-DD. Also the as-of date for instant facts (balance sheet). Null for forms with no period.",
+      "type": ["string", "null"],
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "facts": {
+      "description": "Closed set of 19 normalised facts. Every key is always present; a fact the filing does not report is null, never omitted. Canonical names are ours, not raw XBRL tags - see the alias table in schemas/README.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revenue",
+        "cost_of_revenue",
+        "gross_profit",
+        "operating_income",
+        "net_income",
+        "rnd_expense",
+        "eps_basic",
+        "eps_diluted",
+        "shares_diluted",
+        "assets",
+        "assets_current",
+        "liabilities",
+        "liabilities_current",
+        "equity",
+        "cash",
+        "long_term_debt",
+        "shares_outstanding",
+        "operating_cash_flow",
+        "capex"
+      ],
+      "properties": {
+        "revenue": {
+          "description": "Total revenue for the period. USD. Duration fact.",
+          "type": ["number", "null"]
+        },
+        "cost_of_revenue": {
+          "description": "Cost of goods and services sold. USD. Duration fact.",
+          "type": ["number", "null"]
+        },
+        "gross_profit": {
+          "description": "Gross profit. USD. Duration fact. Null for issuers with no classified income statement (banks).",
+          "type": ["number", "null"]
+        },
+        "operating_income": {
+          "description": "Operating income or loss. USD. Duration fact.",
+          "type": ["number", "null"]
+        },
+        "net_income": {
+          "description": "Net income or loss. USD. Duration fact.",
+          "type": ["number", "null"]
+        },
+        "rnd_expense": {
+          "description": "Research and development expense. USD. Duration fact. Null for issuers that report none.",
+          "type": ["number", "null"]
+        },
+        "eps_basic": {
+          "description": "Basic earnings per share. USD per share. Duration fact.",
+          "type": ["number", "null"]
+        },
+        "eps_diluted": {
+          "description": "Diluted earnings per share. USD per share. Duration fact.",
+          "type": ["number", "null"]
+        },
+        "shares_diluted": {
+          "description": "Weighted average diluted shares outstanding. Shares. Duration fact.",
+          "type": ["number", "null"]
+        },
+        "assets": {
+          "description": "Total assets. USD. Instant fact as of period_end.",
+          "type": ["number", "null"]
+        },
+        "assets_current": {
+          "description": "Total current assets. USD. Instant fact. Null for issuers with an unclassified balance sheet (banks).",
+          "type": ["number", "null"]
+        },
+        "liabilities": {
+          "description": "Total liabilities. USD. Instant fact.",
+          "type": ["number", "null"]
+        },
+        "liabilities_current": {
+          "description": "Total current liabilities. USD. Instant fact. Null for unclassified balance sheets.",
+          "type": ["number", "null"]
+        },
+        "equity": {
+          "description": "Total stockholders equity. USD. Instant fact.",
+          "type": ["number", "null"]
+        },
+        "cash": {
+          "description": "Cash and cash equivalents. USD. Instant fact.",
+          "type": ["number", "null"]
+        },
+        "long_term_debt": {
+          "description": "Long-term debt, noncurrent portion. USD. Instant fact.",
+          "type": ["number", "null"]
+        },
+        "shares_outstanding": {
+          "description": "Common shares outstanding as of the cover date. Shares. Instant fact.",
+          "type": ["number", "null"]
+        },
+        "operating_cash_flow": {
+          "description": "Net cash provided by operating activities. USD. Duration fact. Usually null on quarterly filings: cash-flow statements are tagged year-to-date only, which fails the discrete-quarter tolerance.",
+          "type": ["number", "null"]
+        },
+        "capex": {
+          "description": "Payments to acquire property, plant and equipment. USD. Duration fact, positive for cash spent. Usually null on quarterly filings for the same reason as operating_cash_flow.",
+          "type": ["number", "null"]
+        }
+      }
+    },
+    "ingested_at": {
+      "description": "When the producer emitted this message, ISO 8601 UTC with a trailing Z.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    }
+  }
+}

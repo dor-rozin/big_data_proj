@@ -77,9 +77,50 @@ docker compose down
 | `producer/`   | Ingest: yfinance → Kafka           | Person A  |
 | `spark/`      | Transform + MLlib anomaly detection| Person B  |
 | `spark/` (ES load) + `dashboard/` | Load + results/dashboard | Person C |
+| `schemas/`    | Frozen Kafka message contract      | Person A  |
+| `scripts/`    | Operational helper scripts         | Person A  |
 
 Each stage passes data by a defined schema (see `pipeline.py`), so the three
 parts can be built and tested independently.
+
+The Kafka message contract for the reworked producer stage — field tables,
+nullability, and the UTC/uppercase-ticker/zero-padded-CIK rules — is frozen in
+[`schemas/README.md`](schemas/README.md).
+
+### Local development environment
+
+The pipeline itself runs entirely in Docker and needs no local Python. A venv is
+only for working on the producer half (schemas, scripts, producers) outside a
+container:
+
+```bash
+uv venv --python 3.11 .venv          # or: python3.11 -m venv .venv
+source .venv/bin/activate
+uv pip install -r requirements-dev.txt   # or: pip install -r requirements-dev.txt
+
+python scripts/validate_schemas.py   # verify it works
+```
+
+Python 3.11 matches the `python:3.11-slim` base image in `producer/Dockerfile`.
+`requirements-dev.txt` deliberately excludes `spark/` and `dashboard/` deps —
+those run in Docker and are owned by the other half of the team.
+
+It defines three topics:
+
+| topic | contents | structured? |
+|---|---|---|
+| `market.prices.v1` | OHLCV price bars | numeric |
+| `sec.filings.v1` | 19 normalised financial facts per filing | numeric |
+| `sec.text.v1` | 8-K earnings press releases, plain text | **unstructured** |
+
+`sec.text.v1` is where the project's unstructured data comes from now that
+filings replaced news headlines. The text is the `EX-99.1` exhibit of an earnings
+8-K, which is filed the day before the matching 10-Q — so it lands on the day the
+stock actually reacts, and joins to a price anomaly by date.
+
+These topics are **not yet wired into the run steps above**; the pipeline still
+runs on the original `prices` / `news` topics until the producer rework lands.
+See [`.claude/index.md`](.claude/index.md) for that backlog.
 
 ## Configuration (`.env`)
 
