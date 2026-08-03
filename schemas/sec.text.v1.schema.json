@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dor-rozin/big_data_proj/schemas/sec.text.v1.schema.json",
+  "title": "sec.text.v1",
+  "description": "One block of narrative text extracted from an SEC filing. Kafka message key is the CIK, matching sec.filings.v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "cik",
+    "ticker",
+    "accession_no",
+    "form_type",
+    "filed_date",
+    "section",
+    "source_document",
+    "title",
+    "text",
+    "chunk_index",
+    "chunk_total",
+    "ingested_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Contract version. Bumping this means a new topic, not a new value here.",
+      "type": "integer",
+      "const": 1
+    },
+    "cik": {
+      "description": "SEC Central Index Key, zero-padded to exactly 10 digits. Joins to sec.filings.v1.",
+      "type": "string",
+      "pattern": "^[0-9]{10}$"
+    },
+    "ticker": {
+      "description": "Uppercase ticker. Null when the CIK maps to no listed ticker.",
+      "type": ["string", "null"],
+      "pattern": "^[A-Z][A-Z.]*$",
+      "minLength": 1,
+      "maxLength": 12
+    },
+    "accession_no": {
+      "description": "Accession number of the filing this text came from, dashed form. Joins to sec.filings.v1.",
+      "type": "string",
+      "pattern": "^[0-9]{10}-[0-9]{2}-[0-9]{6}$"
+    },
+    "form_type": {
+      "description": "Form type of the parent filing, e.g. 8-K, 10-K, 10-Q.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20
+    },
+    "filed_date": {
+      "description": "Date the SEC accepted the parent filing, YYYY-MM-DD. This is the date to join against price bars: an earnings 8-K lands on the day the stock reacts.",
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "section": {
+      "description": "Which part of the filing this text is. Only press_release is produced today; risk_factors and mda are reserved so adding them later is not a contract change.",
+      "type": "string",
+      "enum": ["press_release", "risk_factors", "mda"]
+    },
+    "source_document": {
+      "description": "The filing attachment the text came from, e.g. EX-99.1. Null when the text came from the primary document rather than an exhibit.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 40
+    },
+    "title": {
+      "description": "Headline of the document, e.g. 'Apple reports third quarter results'. Null when no heading could be identified. For display only - never parse meaning out of it.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "text": {
+      "description": "The narrative text itself, plain text with HTML stripped and whitespace collapsed. Never empty: a section with no text is not emitted at all.",
+      "type": "string",
+      "minLength": 1
+    },
+    "chunk_index": {
+      "description": "0-based position of this chunk within the section. Always 0 for documents that fit in one message.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "chunk_total": {
+      "description": "Total number of chunks the section was split into. Always 1 for documents that fit in one message. Present from day one so that splitting long sections later is not a contract change.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "ingested_at": {
+      "description": "When the producer emitted this message, ISO 8601 UTC with a trailing Z.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    }
+  }
+}

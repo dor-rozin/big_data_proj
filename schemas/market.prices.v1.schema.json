@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dor-rozin/big_data_proj/schemas/market.prices.v1.schema.json",
+  "title": "market.prices.v1",
+  "description": "One OHLCV price bar for one ticker over one interval. Kafka message key is the ticker.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ticker",
+    "ts",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "interval",
+    "ingested_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Contract version. Bumping this means a new topic, not a new value here.",
+      "type": "integer",
+      "const": 1
+    },
+    "ticker": {
+      "description": "Uppercase ticker symbol. Dots allowed for share classes (BRK.B).",
+      "type": "string",
+      "pattern": "^[A-Z][A-Z.]*$",
+      "minLength": 1,
+      "maxLength": 12
+    },
+    "ts": {
+      "description": "Start of the bar's period, ISO 8601 UTC with a trailing Z.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "open": {
+      "description": "Opening price. Null when the source had no value for this bar.",
+      "type": ["number", "null"]
+    },
+    "high": {
+      "description": "Highest price in the period.",
+      "type": ["number", "null"]
+    },
+    "low": {
+      "description": "Lowest price in the period.",
+      "type": ["number", "null"]
+    },
+    "close": {
+      "description": "Closing price.",
+      "type": ["number", "null"]
+    },
+    "volume": {
+      "description": "Shares traded in the period.",
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "interval": {
+      "description": "Bar width. Fixed enum — a new width is a contract change.",
+      "type": "string",
+      "enum": ["1d", "1h", "5m", "1m"]
+    },
+    "ingested_at": {
+      "description": "When the producer emitted this message, ISO 8601 UTC with a trailing Z.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    }
+  }
+}
