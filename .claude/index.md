@@ -19,6 +19,7 @@ status changes.
 | [0008](0008-live-producer-finnhub-websocket.md) | Live producer — Finnhub WebSocket | todo | 0001, 0003, 0004, 0007 |
 | [0009](0009-readme-and-demo-runbook.md) | README + demo runbook + cold-start check | todo | 0002–0004, 0007 |
 | [0010](0010-filing-text-producer.md) | Filing text — 8-K press releases → `sec.text.v1` | todo | 0001, 0003, 0006 |
+| [0011](0011-dagster-orchestration.md) | Dagster orchestration for the interval Spark run (stretch) | todo | 0007, 0009 |
 
 **Legend:** `todo` → `in-progress` → `done` (mirror whatever value is in the
 ticket's own `status:` frontmatter field).
@@ -50,6 +51,8 @@ Per the suggested schedule in [README.md](README.md#order-of-work):
    the only ticket that produces unstructured data.
 5. **0009** (demo runbook) before **0008** (live WebSocket) in week 2 — 0008 is
    cuttable if time is tight.
+6. **0011** (Dagster orchestration) is a backpocket stretch item — only pick it
+   up once 0007 and 0009 are done and there's time left before the demo.
 
 ## How to keep this file honest
 

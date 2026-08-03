@@ -18,6 +18,7 @@ Spark, Elasticsearch, and Kibana.
 | 0008 | Live producer — Finnhub WebSocket trades aggregated into bars | P2 | 0001, 0003, 0004, 0007 |
 | 0009 | README, demo runbook, and cold-start verification | P1 | 0002–0004, 0007 |
 | 0010 | Filing text — 8-K press releases into `sec.text.v1` | P1 | 0001, 0003, 0006 |
+| 0011 | Dagster orchestration for the interval Spark run (stretch) | P3 | 0007, 0009 |
 
 ## Data sources
 
