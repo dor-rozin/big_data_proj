@@ -191,3 +191,85 @@ at delivering clean text; how it is scored is the consumer half's decision.
 
 **Status:** contract done, producer not written. `sec.text.v1` needs adding to
 ticket 0003's topic list when that lands.
+
+### 2026-08-03 — Ad hoc historical price snapshot (Amir)
+
+Added `scripts/fetch_historical_data.py`, a standalone script (not part of the
+ticket 0001–0010 backlog) that pulls 2 years of daily bars for 10 named large-cap
+tickers (NVDA, AAPL, MSFT, AMZN, GOOGL, AVGO, META, TSLA, BRK.B, JPM) via
+`yfinance.Ticker(...).history()` and writes one parquet file per ticker plus a
+combined `all.parquet` to `historical_data/` (gitignored — already covered by the
+existing `*.parquet` rule).
+
+**Finding — `BRK.B` fails against Yahoo as-is.** Yahoo's endpoint expects the
+dash form (`BRK-B`), not the dot form; the script maps `.` → `-` before the
+fetch call but keeps the original dotted ticker in the output data.
+
+**Conforms to the frozen `market.prices.v1` contract.** Reworked to emit exactly
+the 10 contract fields (`schema_version`, `ticker`, `ts`, `open`, `high`, `low`,
+`close`, `volume`, `interval`, `ingested_at`) instead of raw yfinance column
+names — dropped `Dividends`/`Stock Splits`, converted timestamps to UTC with a
+trailing `Z`, cast numpy scalars to native Python types, and replaced NaN with
+`None`.
+
+**Verified:** all 10 tickers returned 500 rows each (5,000 rows total, zero
+NaNs). Every row of the combined parquet, round-tripped through
+`json.dumps`/`json.loads`, validates against
+`schemas/market.prices.v1.schema.json` via `jsonschema.Draft202012Validator`
+with zero errors.
+
+**Not related to ticket 0005** (`yfinance snapshot to disk`, still `todo`) —
+that ticket covers the full 30–50 ticker universe with chunked retries/backoff,
+`config/tickers.txt`, and a `.meta.json` sidecar for Kafka replay. This script
+is a quick one-off pull for ad hoc analysis: same contract shape, but no
+retry/backoff logic and a fixed 10-ticker list instead of a config file.
+
+Output moved to `historical_data/market.prices.v1.historical/` — subfolder named
+after the `market.prices.v1` Kafka topic with a `.historical` suffix, so it
+reads clearly as the offline snapshot rather than live topic traffic.
+
+### 2026-08-03 — Ad hoc EDGAR filings snapshot for the same 10 companies (Amir)
+
+Added `scripts/fetch_historical_filings.py` (also standalone, not part of the
+0001–0010 backlog), the `sec.filings.v1` counterpart to the price snapshot
+above. Pulls every `10-K`/`10-Q` on file for the same 10 tickers via
+`edgartools`' `Company(ticker).get_filings()` / `.get_facts()`, resolves the
+closed 19-key fact set through the alias table and duration/instant selection
+rules in `schemas/README.md` (never a raw XBRL tag lookup), and writes one
+parquet per ticker plus `all.parquet` to
+`historical_data/sec.filings.v1.historical/` (gitignored, same as the prices
+folder).
+
+Requires `SEC_IDENTITY` (name + email) in the environment — the script exits
+with an explanatory message before any network call if it's unset, per the SEC
+User-Agent requirement. Not yet added to `.env.example`/README since this is an
+ad hoc script exported manually, not a container-driven step; revisit if this
+becomes a normal part of setup.
+
+**Verified against real filings, matching the coverage already documented for
+ticket 0001:** Apple's FY2025 10-K resolves all 19 facts; JPMorgan's FY2025 10-K
+resolves 9 of 19 (the bank-shaped nulls: `gross_profit`, `cost_of_revenue`,
+`operating_income`, `assets_current`, `liabilities_current`); quarterly filings
+correctly null out `operating_cash_flow`/`capex` (YTD-tagged, fails the
+discrete-quarter tolerance). All 913 rows across the 10 tickers (33–131 filings
+each depending on how far back EDGAR's structured facts go per company)
+validate against `schemas/sec.filings.v1.schema.json` with zero errors and zero
+NaN; largest serialized row is 855 bytes, well under the 8 KB ceiling ticket
+0006 sets to prove no raw filing text leaked in.
+
+**Gotcha worth flagging for any future consumer of these parquet files:**
+reading them back with pandas ≥3.0's default Arrow-backed string dtype and
+calling `.to_dict()`/`.iterrows()` turns a true null into a Python
+`float('nan')`, not `None` — `pd.isna()` still says it's missing, but
+`json.dumps` on it silently emits invalid literal `NaN`. The parquet files
+themselves store correct Arrow nulls (verified directly with `pyarrow`); this
+is a read-side pitfall, not a write-side one. Any code that serializes these
+rows to JSON must explicitly replace NA with `None` first
+(`df.astype(object).where(pd.notna(df), None)`), the same "kill NaN before it
+becomes JSON" lesson ticket 0005 already documents for the price data.
+
+**Not related to ticket 0006** (`EDGAR snapshot to disk`, still `todo`) — that
+ticket covers the full ticker universe, a `SEC_IDENTITY`-gated CLI with
+`--forms`/`--since`/`--limit` flags, a cached `cik_map.json`, and resilience/
+rate-limit tests. This script is a fixed 10-ticker one-off with no CLI flags,
+no CIK-map cache, and no automated test.
