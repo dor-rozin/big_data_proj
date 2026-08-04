@@ -1,7 +1,7 @@
 ---
 id: 0003
 title: Topic provisioning — create both topics with explicit, replayable config
-status: todo
+status: in-progress
 layer: infrastructure
 priority: P0
 depends_on: [0002]

@@ -1,2 +1,11 @@
-yfinance==0.2.40
-kafka-python==2.0.2
+# Kafka client. confluent-kafka (librdkafka) rather than kafka-python: it is the
+# client the admin/topic scripts use, and it exposes both the delivery callbacks
+# and the BufferError backpressure signal this producer relies on.
+confluent-kafka==2.5.3
+
+# Reading the snapshot parquet files.
+pandas==2.2.2
+pyarrow==16.1.0
+
+# Contract self-check against schemas/*.schema.json before producing.
+jsonschema==4.23.0

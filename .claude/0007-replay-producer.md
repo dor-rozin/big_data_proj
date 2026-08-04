@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Replay producer — stream the snapshot files into Kafka at controllable speed
-status: todo
+status: in-progress
 layer: producers
 priority: P0
 depends_on: [0003, 0004, 0005, 0006]

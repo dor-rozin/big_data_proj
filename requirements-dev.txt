@@ -19,11 +19,19 @@
 # reconcile produce.py against it under ticket 0005 before changing the container.
 yfinance==1.5.2
 
-# --- tickets 0003/0004/0007: topic admin and producers -----------------------
-# The tickets specify confluent_kafka.admin.AdminClient. producer/produce.py
-# still imports kafka-python; both are installed until that rework lands.
+# --- tickets 0003/0007: topic admin and producers ----------------------------
+# confluent-kafka only. kafka-python was dropped when produce.py was rewritten
+# as the snapshot replay producer: the admin client, the delivery callbacks, and
+# the BufferError backpressure signal all come from librdkafka.
 confluent-kafka==2.5.0
-kafka-python==2.0.2
+
+# The producer reads the snapshot parquet files. These are the versions this
+# venv is built against and the producer is verified on; the container pins
+# older ones (producer/requirements.txt: pandas 2.2.2 / pyarrow 16.1.0) to match
+# what Spark needs. produce.py works on both — it uses read_parquet and
+# to_dict("records") and nothing that moved between pandas 2 and 3.
+pandas==3.0.5
+pyarrow==25.0.0
 
 # --- ticket 0006: EDGAR snapshot ---------------------------------------------
 edgartools==3.11.2

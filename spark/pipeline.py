@@ -27,7 +27,7 @@ from pyspark.ml.clustering import KMeans
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ---- config ---------------------------------------------------------------
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 PRICES_TOPIC = os.getenv("PRICES_TOPIC", "prices")
 NEWS_TOPIC = os.getenv("NEWS_TOPIC", "news")
 ES_HOST = os.getenv("ES_HOST", "http://elasticsearch:9200")
