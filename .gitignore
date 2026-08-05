@@ -13,11 +13,19 @@ data/
 *.parquet
 # Exception: small, reproducible historical snapshot fixtures (~850 KB total).
 !/historical_data/**/*.parquet
+# ...but not the derived split file. It is regenerated output of the deprecated
+# scripts/load_historical_prices_to_kafka.py; the replay producer reads
+# all.parquet directly and does not need it.
+/historical_data/**/remaining_for_replay.parquet
 
 # Docker / local
 .env
 elasticsearch-data/
 spark-ivy/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
 
 # Editors / OS
 .vscode/

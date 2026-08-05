@@ -1,0 +1,2 @@
+# Dependencies for the helper scripts in this folder.
+jsonschema==4.23.0

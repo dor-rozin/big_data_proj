@@ -1,93 +1,266 @@
-# Big Data & AI course project
-# Pipeline: yfinance -> Kafka -> Spark (transform + MLlib) -> Elasticsearch -> Streamlit
+# Big Data & AI course project.
+# Pipeline: snapshot files -> Kafka -> Spark (features + MLlib) -> Elasticsearch -> Streamlit
 #
-# Usage:
-#   docker compose up -d kafka elasticsearch     # start infrastructure
-#   docker compose run --rm producer             # pull yfinance data into Kafka
-#   docker compose run --rm spark                # transform + anomaly detection + load ES
-#   docker compose up -d dashboard               # start the Streamlit dashboard (http://localhost:8501)
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+#   cp .env.example .env                            # once, before anything else
+#   docker compose up -d                            # infra + topics + dashboard
+#   bash scripts/verify_stack.sh                    # PASS/FAIL per service
+#   docker compose run --rm producer                # backfill a year of history
+#   docker compose --profile live up -d producer-live   # then stream the rest
+#   docker compose run --rm spark                   # transform + ES load
+#
+# `docker compose down` keeps the data (named volumes).
+# `docker compose down -v` is the clean slate.
+#
+# ---------------------------------------------------------------------------
+# Kafka listener contract -- do not change these ports without updating every
+# consumer of KAFKA_BOOTSTRAP.
+# ---------------------------------------------------------------------------
+#   PLAINTEXT      kafka:9092       clients INSIDE this compose network
+#                                   (producer, spark, kafka-ui, topic-init)
+#   PLAINTEXT_HOST localhost:29092  clients on the HOST
+#                                   (scripts run from the dev venv)
+#
+# Misconfigured advertised listeners are the single largest time sink in a stack
+# of this shape: the broker starts, the logs look clean, and the client times out
+# in a way that looks like the client's bug.
+
+name: big-data-proj
 
 services:
-  # ---------------------------------------------------------------------------
-  # Kafka in KRaft mode (no ZooKeeper -> lighter on RAM). Single-node broker.
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # Kafka, KRaft mode (no ZooKeeper -> one less container and less RAM).
+  # Single node acting as both broker and controller.
+  # ===========================================================================
   kafka:
-    image: apache/kafka:3.8.0
+    image: apache/kafka:3.9.0
     container_name: kafka
+    restart: unless-stopped
+    networks: [pipeline]
     ports:
-      - "9092:9092"          # host access (localhost:9092)
+      - "29092:29092"   # host access -> localhost:29092 (see the contract above)
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      # CONTROLLER must be listed here too, even though it's not client-facing.
+      # In combined broker+controller mode, apache/kafka:3.9.0's storage-format
+      # step (KafkaDockerWrapper -> StorageTool) validates ALL entries in
+      # KAFKA_LISTENERS against KAFKA_ADVERTISED_LISTENERS; a listener present
+      # in one but not the other resolves to the bare 0.0.0.0 from `listeners`
+      # and the broker refuses to start ("advertised.listeners cannot use the
+      # nonroutable meta-address 0.0.0.0"). Confirmed against the image directly
+      # -- this is not in the upstream docs, which only cover controller-only
+      # (not combined) nodes.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092,CONTROLLER://kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Single-node replication. Without all three the broker refuses to create
+      # its internal topics and consumers hang with no useful error.
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Topics are provisioned explicitly by the topic-init service below.
+      # With auto-create left on, a typo'd topic name silently produces a
+      # one-partition, seven-day-retention topic instead of an error, and the
+      # data quietly disappears a week later.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # The image's own default (log.dirs=/tmp/kraft-combined-logs) does NOT
+      # match the volume mount below. Without this override, the named volume
+      # mounts a path Kafka never writes to and every byte lives in the
+      # container's writable layer -- gone on `docker compose down`, not just
+      # `down -v`. Confirmed by inspecting the image's default server.properties.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 15
+      start_period: 20s
 
-  # ---------------------------------------------------------------------------
-  # Elasticsearch single node. Security disabled for a local demo.
-  # Heap capped at 512m to stay within an 8 GB Docker allocation.
-  # ---------------------------------------------------------------------------
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
-    container_name: elasticsearch
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-    ports:
-      - "9200:9200"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health >/dev/null || exit 1"]
-      interval: 10s
-      timeout: 10s
-      retries: 15
-
-  # ---------------------------------------------------------------------------
-  # Producer: pulls prices + news from yfinance and publishes JSON to Kafka.
-  # Run on demand (docker compose run --rm producer), not a long-running service.
-  # ---------------------------------------------------------------------------
-  producer:
-    build: ./producer
-    container_name: producer
+  # ===========================================================================
+  # Topic provisioning. Runs to completion, then exits; everything that writes
+  # to or reads from Kafka waits for it. Idempotent: on a second run it verifies
+  # config and reports drift rather than recreating anything.
+  # ===========================================================================
+  topic-init:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    image: big-data-proj/producer:latest
+    container_name: topic-init
+    networks: [pipeline]
     depends_on:
       kafka:
         condition: service_healthy
     env_file: .env
+    restart: "no"
+    command: ["python", "scripts/create_topics.py", "--bootstrap", "kafka:9092"]
 
-  # ---------------------------------------------------------------------------
-  # Spark pipeline: reads Kafka -> features + KMeans anomaly detection +
-  # VADER sentiment -> writes to Elasticsearch. Run on demand.
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # Elasticsearch, single node. Security is disabled deliberately for a local
+  # course project -- see versions.md. Do not carry this config anywhere near
+  # the internet.
+  # ===========================================================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: elasticsearch
+    restart: unless-stopped
+    networks: [pipeline]
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -Eq '\"status\":\"(yellow|green)\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  # ===========================================================================
+  # kafka-ui -- browser view of the broker. Optional but cheap, and it turns
+  # "is the message actually there" into a browser refresh.
+  # ===========================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: unless-stopped
+    networks: [pipeline]
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - DYNAMIC_CONFIG_ENABLED=true
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Producer, job 1 of 2 -- BACKFILL.
+  #
+  # Sends everything before the split (first price bar + BACKFILL_DAYS) as fast
+  # as the broker accepts. Run this once after the stack comes up, so the topics
+  # already hold a year of history and the pipeline looks like a system that has
+  # been running for a year rather than one that started thirty seconds ago.
+  #
+  #   docker compose run --rm producer
+  #
+  # One-shot; exits when done. The build context is the repo root, not
+  # ./producer, because the image needs schemas/ for its pre-send contract check.
+  # ===========================================================================
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    image: big-data-proj/producer:latest
+    container_name: producer
+    networks: [pipeline]
+    # Not started by `docker compose up`; `docker compose run` enables the
+    # profile automatically. These are one-shot jobs, and having `up` fire them
+    # means every restart of the stack silently reloads the whole snapshot.
+    profiles: ["jobs"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    env_file: .env
+    restart: "no"
+    # tini as PID 1, so Ctrl-C reaches the producer and it flushes before exit
+    # instead of dropping its buffered tail.
+    init: true
+    volumes:
+      # Read-only: the producer replays this data, it never writes it.
+      - ./historical_data:/snapshots:ro
+    command: ["python", "produce.py", "--mode", "backfill"]
+
+  # ===========================================================================
+  # Producer, job 2 of 2 -- LIVE SIMULATION.
+  #
+  # Sends everything at or after the same split, paced so it looks like data
+  # arriving now. Long-running, so it gets `up` rather than `run`:
+  #
+  #   docker compose --profile live up -d producer-live
+  #   docker compose logs -f producer-live
+  #   docker compose --profile live down
+  #
+  # Same image and same .env as the backfill job. The split is read from
+  # BACKFILL_DAYS in .env by BOTH services -- that shared value is what makes
+  # them exactly complementary. Do not pass --backfill-days here and not there.
+  #
+  # REPLAY_DURATION (default 300s) controls how long the live year takes to play
+  # out. Add --loop to the command below for a demo that never runs dry.
+  # ===========================================================================
+  producer-live:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    image: big-data-proj/producer:latest
+    container_name: producer-live
+    networks: [pipeline]
+    profiles: ["live"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    env_file: .env
+    # `no`, not `unless-stopped`: this job has a natural end. Restarting it
+    # automatically would silently replay the same year over and over, which is
+    # what --loop is for when you actually want it.
+    restart: "no"
+    init: true
+    volumes:
+      - ./historical_data:/snapshots:ro
+    command: ["python", "produce.py", "--mode", "live"]
+
+  # ===========================================================================
+  # Spark: Kafka -> features + KMeans anomaly detection + sentiment -> ES.
+  # Run on demand. Runs in local mode inside this one container; no master or
+  # worker services by design.
+  # ===========================================================================
   spark:
     build: ./spark
     container_name: spark
+    networks: [pipeline]
+    profiles: ["jobs"]   # run on demand, see the producer service above
     depends_on:
       kafka:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
     env_file: .env
+    restart: "no"
+    init: true
     volumes:
-      - spark-ivy:/root/.ivy2   # cache the downloaded Kafka connector jar between runs
+      - spark-ivy:/root/.ivy2   # cache the Kafka connector jar between runs
 
-  # ---------------------------------------------------------------------------
-  # Streamlit dashboard: reads Elasticsearch and shows the findings.
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # Streamlit dashboard, reading Elasticsearch. http://localhost:8501
+  # ===========================================================================
   dashboard:
     build: ./dashboard
     container_name: dashboard
+    restart: unless-stopped
+    networks: [pipeline]
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -95,5 +268,13 @@ services:
     ports:
       - "8501:8501"
 
+networks:
+  # One explicit user-defined bridge, so service names resolve predictably and
+  # the network is not named after whatever directory the repo was cloned into.
+  pipeline:
+    driver: bridge
+
 volumes:
+  kafka-data:
+  es-data:
   spark-ivy:
