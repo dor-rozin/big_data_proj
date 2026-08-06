@@ -12,8 +12,8 @@ Expected end state:
 |---|---|---|---|---|
 | `market.prices.v1` | 2,500 | | `stock_prices` | 2,500 |
 | `sec.filings.v1` | 875 | | `stock_filings` | 875 |
-| `sec.text.v1` | 1 | | `stock_context` | 10 |
-| | | | `stock_analysis` | 10 |
+| `sec.text.v1` | 60 | | `stock_context` | 10 |
+| **backfill total** | **3,435** | | `stock_analysis` | 10 |
 
 ---
 
@@ -166,19 +166,30 @@ claiming anything downstream was created.
 docker compose run --rm producer
 ```
 
-**Expect:** `delivered : 3375`, `failed : 0`, about a second.
+**Expect:** `delivered : 3435`, `failed : 0`, about a second.
 
 **Validate the split:**
 
 ```bash
-for t in market.prices.v1 sec.filings.v1; do
+for t in market.prices.v1 sec.filings.v1 sec.text.v1; do
   echo -n "$t: "
   docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
     --bootstrap-server localhost:9092 --topic $t | awk -F: '{s+=$3} END {print s+0}'
 done
 ```
 
-**Expect `2500` and `875`** — together the 3,375 delivered.
+**Expect `2500`, `875` and `60`** — together the 3,435 delivered.
+
+The producer also prints why the text count is small:
+
+```
+text: 116 of 1,324 press releases ... land on or after the first price bar
+      (2024-08-05); the rest predate it and are skipped
+```
+
+The archive goes back to 2000, but a press release with no price bar to join
+against is noise. 116 survive the clip; 60 of those fall in the backfill window
+and the rest go to the live stream.
 
 **See a RAW message. This is the "before" half of the comparison in step 7:**
 
@@ -209,25 +220,11 @@ per-company ordering is guaranteed — not a bug.
 
 ---
 
-## 5 · Load the filing-text sample
+## 5 · (nothing to do — text arrives with the producer)
 
-```bash
-docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
-  --bootstrap-server localhost:9092 --topic sec.text.v1 \
-  < schemas/samples/sec.text.v1.json
-```
-
-`sec.text.v1` has no producer yet (ticket 0010), so this hand-loads one real
-document to exercise the text path end to end.
-
-**Validate** — expect `1`:
-
-```bash
-docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
-  --bootstrap-server localhost:9092 --topic sec.text.v1 | awk -F: '{s+=$3} END {print s+0}'
-```
-
----
+Earlier versions of this runbook hand-loaded a single sample message here,
+because `sec.text.v1` had no producer. **Ticket 0010 landed and it does now** —
+step 4 already delivered 60 press releases. Nothing to run.
 
 ## 6 · Spark pipeline
 
@@ -263,8 +260,8 @@ set `LLM_PROVIDER=gemini`, or `LLM_ENABLED=false` to skip the stage.
 
 | Stage | Line |
 |---|---|
-| 1 | `2500 messages parsed`, `875`, `1` |
-| 2 | `prices: 2500` · `filings: 875` · `text: 1` · `groups: 10` |
+| 1 | `2500 messages parsed`, `875`, `60` |
+| 2 | `prices: 2500` · `filings: 875` · `text: 60` · `groups: 10` |
 | 2b | `10 groups, 130 bars flagged at top 5% per group` |
 | 3 | `aggregated to 10 row(s)` |
 | 3b | `dumped 10 prompt(s)` |
@@ -437,10 +434,11 @@ no offset state to track, and running it twice equals running it once.
 retired `stock_news` index. That is Person C's stage and it has not been started.
 Validate through Elasticsearch and kafka-ui.
 
-**9 of 10 instruments report `filing_text_available: false`.** Only the
-hand-loaded sample carries text, so the analyst notes name the missing narrative
-as a stated limitation and lower their own confidence. Correct until ticket 0010
-lands a producer for `sec.text.v1`.
+**All 10 instruments should now report `filing_text_available: true`.** Ticket
+0010 landed the text producer, so every prompt carries a real press release.
+Prompts grew from ~4,300 to ~12,000 characters as a result — roughly 3,000 tokens
+each, which is why the daily budget now stretches to about three runs rather than
+seven.
 
 ```bash
 curl -s "localhost:9200/stock_context/_search?pretty" -H 'Content-Type: application/json' \

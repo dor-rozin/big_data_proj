@@ -251,6 +251,11 @@ It defines three topics:
 | `sec.filings.v1` | 19 normalised financial facts per filing | numeric |
 | `sec.text.v1` | 8-K earnings press releases, plain text | **unstructured** |
 
+The text archive holds 1,324 press releases back to 2000, but the producer clips
+to those on or after the first price bar — a release with no price bar to join
+against is noise. 116 survive that clip on the current snapshot, 60 of them in
+the backfill window.
+
 `sec.text.v1` is where the project's unstructured data comes from now that
 filings replaced news headlines. The text is the `EX-99.1` exhibit of an earnings
 8-K, which is filed the day before the matching 10-Q — so it lands on the day the
@@ -471,14 +476,19 @@ Docker Desktop to 10-12 GB before enabling it. Insurance, not the everyday path.
 | | Groq | Gemini |
 |---|---|---|
 | Default model | `llama-3.3-70b-versatile` | `gemini-3.6-flash` |
-| Free tier | **100,000 tokens/day** (~7 ten-instrument runs) | ~5 req/min **and** ~30 calls/day |
+| Free tier | **100,000 tokens/day** (~3 ten-instrument runs) | ~5 req/min **and** ~30 calls/day |
 | Ten-instrument run | **~1 min** | ~2.5 min, and often quota-blocked |
 | Default pacing | 1s | 13s |
 
 **Groq is the one to develop against**, but both have a daily budget and both
 will refuse you eventually. Groq meters **tokens**, not requests: 100,000/day
-against ~13k per ten-instrument run, so about seven runs. Gemini allows roughly
-two. Either way, iterate with `LLM_ENABLED=false` — the prompts are still
+against ~35k per ten-instrument run, so about three runs. Gemini allows roughly
+two.
+
+That per-run cost tripled when ticket 0010 landed filing text for every
+instrument — prompts went from ~4,300 to ~12,000 characters. `LLM_MAX_TEXT_CHARS`
+(default 6,000) is the lever: halving it roughly halves the token cost, at the
+price of giving the analyst less narrative to work with. Either way, iterate with `LLM_ENABLED=false` — the prompts are still
 dumped, so the context stays inspectable — and spend the budget on runs that
 matter.
 

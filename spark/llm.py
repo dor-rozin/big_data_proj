@@ -20,6 +20,7 @@ full coverage is worse than one that fails.
 import json
 import os
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -391,10 +392,20 @@ def call_llm(prompt, model, api_key, provider="gemini", timeout=90,
             else:
                 delay = backoff_base ** attempt
         except urllib.error.URLError as exc:
-            # No route / refused / DNS failure: the provider is not reachable at
-            # all, and will not become reachable mid-run.
-            raise ProviderUnavailable(
-                f"{provider}: unreachable at {url} ({exc.reason})") from exc
+            # Not every URLError means the provider is gone. A refused
+            # connection or a DNS failure does — nothing is listening, and that
+            # will not change mid-run (Ollama not started, a typo'd host). But a
+            # dropped TLS handshake or a reset connection is ordinary internet
+            # turbulence, and retiring a working provider over one of those
+            # sends the rest of the run to a slower fallback for no reason.
+            # Observed in practice: a single `SSL: UNEXPECTED_EOF_WHILE_READING`
+            # retired Groq mid-run while it was perfectly healthy.
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+                raise ProviderUnavailable(
+                    f"{provider}: unreachable at {url} ({reason})") from exc
+            last = GeminiError(f"{type(reason).__name__}: {reason}")
+            delay = backoff_base ** attempt
         except (TimeoutError, json.JSONDecodeError) as exc:
             last = GeminiError(f"{type(exc).__name__}: {exc}")
             delay = backoff_base ** attempt
