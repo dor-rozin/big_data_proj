@@ -14,12 +14,43 @@ conversation with the whole team, not a commit.
 Keying by `ticker` / `cik` puts every message about one company on one partition,
 so per-company ordering holds without an ordering guarantee across the topic.
 
-`sec.filings.v1` and `sec.text.v1` are the numbers and the words from the same
-filings, split across two topics rather than combined into one. A facts message is
-~1 KB and a press release is ~12 KB; a full 10-K is 357 KB. Putting them together
-would make every small message pay for the large ones, and they have different
-consumers (a numeric join vs NLP) and different Elasticsearch mappings (numerics
-vs analyzed text). Join them on `accession_no`, or on `cik` + `filed_date`.
+`sec.filings.v1` and `sec.text.v1` are the numbers and the words about the same
+companies, split across two topics rather than combined into one. A facts message
+is ~1 KB and a press release is ~12 KB; a full 10-K is 357 KB. Putting them
+together would make every small message pay for the large ones, and they have
+different consumers (a numeric join vs NLP) and different Elasticsearch mappings
+(numerics vs analyzed text).
+
+### Do not join these two topics on `accession_no`
+
+**It matches nothing — zero rows, now and always.** An accession number identifies
+one specific filing. `sec.filings.v1` carries `10-K`/`10-Q`; `sec.text.v1`
+carries the `EX-99.1` of an `8-K`. Those are different documents filed on
+different days, so they never share an accession number. Measured on the current
+snapshot: 913 filings, 1,324 text documents, **0 shared accession numbers**.
+
+This fails *silently* — the join returns an empty result with no error, which
+looks exactly like a blank dashboard panel rather than a bug.
+
+**Join on `cik` plus a `filed_date` window instead**, and expect partial
+coverage. The earnings 8-K lands the day *before* the matching 10-Q, which is
+what makes the text valuable — it is dated to the day the stock reacts — but it
+also means exact-date matching misses almost everything:
+
+| window | earnings-like releases | all text documents |
+|---|---|---|
+| exact date | 20% | 11% |
+| ±1 day | 54% | 30% |
+| ±3 days | 61% | 35% |
+
+Coverage never approaches 100% because **most 8-Ks are not tied to a periodic
+filing at all** — a leadership change or a legal settlement has no 10-Q to match.
+Treat an unmatched press release as normal, not as missing data.
+
+The join that would actually be correct is by fiscal period — "the 8-K announcing
+Q3 results" ↔ "the 10-Q for Q3" — but `sec.text.v1` carries no period field, so
+that needs a new (nullable) field and therefore a real contract conversation.
+Tracked as a ticket, not done here.
 
 ## Cross-cutting rules
 
@@ -187,10 +218,32 @@ messages are emitted; neither is suppressed. Consumers deduplicate by keeping
 `max(filed_date)` per `(cik, fiscal_period, period_end)`. Because messages are
 keyed by `cik`, all candidates for a given company land on one partition.
 
-### Form types are not filtered
+### Which form types this topic carries
 
-Do not assume `8-K` means "no financials" — Apple's earnings-release 8-Ks carry
-569 facts. The producer emits whatever resolves, whatever the form.
+`sec.filings.v1` is built from **`10-K` and `10-Q` only**
+(`scripts/fetch_historical_filings.py`). Within those, form type is not used to
+filter or to guess at content: the producer emits whatever facts resolve,
+whatever the form, and a `10-Q` with sparse facts is normal rather than an error.
+
+**Earlier revisions of this file said 8-K earnings releases "carry 569 facts"
+and implied they belonged on this topic. That is misleading and cost a teammate
+a wasted investigation, so here is the measurement.** The 569-fact example was
+Apple's accession `0001193125-15-023732` — a **2015** filing. Modern earnings
+8-Ks do not attribute XBRL facts to the 8-K accession. Across the 8-Ks this
+project actually has text for:
+
+| ticker | 8-Ks with text | of those, carrying XBRL facts |
+|---|---|---|
+| AAPL | 116 | 2 (2%) |
+| MSFT | 190 | 3 (2%) |
+| JPM | 322 | 0 |
+
+So adding `8-K` to this topic to make an `accession_no` join line up would add
+~1,324 rows of which ~98% carry entirely null facts. Worse, `fiscal_period` is a
+**required, non-nullable** enum here, and the XBRL `fp` field is empty even on
+the 8-Ks that do carry facts — every one of those rows would need a *fabricated*
+fiscal period. That is why the join is documented as `cik` + date window above
+rather than "fixed" by widening this topic.
 
 ## `sec.text.v1`
 
@@ -202,7 +255,7 @@ data: `market.prices.v1` and `sec.filings.v1` are both entirely numeric.
 | `schema_version` | integer, const `1` | no | Contract version. Always `1` on this topic. |
 | `cik` | string | no | Central Index Key, zero-padded to 10 digits. Joins to `sec.filings.v1`. |
 | `ticker` | string | yes | Uppercase ticker. |
-| `accession_no` | string | no | Accession of the parent filing. The join key to `sec.filings.v1`. |
+| `accession_no` | string | no | Accession of the parent 8-K. Identifies which filing this text came from — **not** a join key to `sec.filings.v1`, which never carries the same accession. |
 | `form_type` | string | no | Form type of the parent filing. |
 | `filed_date` | string `YYYY-MM-DD` | no | Date the SEC accepted the filing. |
 | `section` | string enum | no | `press_release`, `risk_factors`, `mda`. |
