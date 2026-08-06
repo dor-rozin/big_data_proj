@@ -1,7 +1,7 @@
 ---
 id: 0010
 title: Filing text — extract 8-K press releases to the sec.text.v1 topic
-status: todo
+status: in-progress
 layer: producer
 priority: P1
 depends_on: [0001, 0003, 0006]

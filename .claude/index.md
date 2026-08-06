@@ -18,7 +18,7 @@ status changes.
 | [0007](0007-replay-producer.md) | Replay producer (snapshot → Kafka) | in-progress | 0003–0006 |
 | [0008](0008-live-producer-finnhub-websocket.md) | Live producer — Finnhub WebSocket | todo | 0001, 0003, 0004, 0007 |
 | [0009](0009-readme-and-demo-runbook.md) | README + demo runbook + cold-start check | todo | 0002–0004, 0007 |
-| [0010](0010-filing-text-producer.md) | Filing text — 8-K press releases → `sec.text.v1` | todo | 0001, 0003, 0006 |
+| [0010](0010-filing-text-producer.md) | Filing text — 8-K press releases → `sec.text.v1` | in-progress | 0001, 0003, 0006 |
 | [0011](0011-dagster-orchestration.md) | Dagster orchestration for the interval Spark run (stretch) | todo | 0007, 0009 |
 
 **Legend:** `todo` → `in-progress` → `done` (mirror whatever value is in the
@@ -74,6 +74,17 @@ their scope is bigger than what's been built:
   every consumed message, missing-snapshot error is clean not a traceback.
   **Not yet verified**: `BufferError` retry under an artificially shrunk queue,
   Ctrl-C mid-run flush, and byte-identical payloads across two runs.
+
+**0010 in-progress, not `done`**, for the same reason as 0003/0007: the file
+layout deviates from the ticket spec. `scripts/fetch_historical_text.py` is a
+standalone script (own EDGAR crawl of `8-K` filings, own rate limiting) rather
+than an extension of `fetch_historical_filings.py` that reuses one crawl for
+both facts and text — the ticket's "do not add a second fetch path" line is not
+honored. `producer/produce.py` (not a new `producers/text_producer.py`) merges
+`historical_data/sec.text.v1.historical/all.parquet` into the same timeline as
+prices and filings, keyed by `cik`, same pattern as the filings path. Not yet
+verified against a live broker end to end; the SEC round-trip acceptance
+criterion (`®` and typographic quotes surviving Kafka) is untested.
 
 ## What's up next
 

@@ -2,16 +2,18 @@
 """Snapshot replay producer — the ingest stage of the pipeline.
 
 Turns the on-disk snapshot files in `historical_data/` into a Kafka stream on
-the two contract topics:
+the three contract topics:
 
     historical_data/market.prices.v1.historical/all.parquet  ->  market.prices.v1
     historical_data/sec.filings.v1.historical/all.parquet    ->  sec.filings.v1
+    historical_data/sec.text.v1.historical/all.parquet       ->  sec.text.v1
 
-Both streams are merged into one sequence ordered by **event time** before
-anything is sent, so a filing lands between the price bars that surround it
-chronologically. Emitting all prices and then all filings would leave the
-consumer's join with nothing sensible to do and make the dashboard's time axis
-look wrong; the interleaving is the point of this tool.
+All streams are merged into one sequence ordered by **event time** before
+anything is sent, so a filing (or its press release text) lands between the
+price bars that surround it chronologically. Emitting all prices and then all
+filings would leave the consumer's join with nothing sensible to do and make
+the dashboard's time axis look wrong; the interleaving is the point of this
+tool.
 
 Replay speed changes *when* messages are sent, never the timestamps inside
 them. `ts` and `filed_date` are always the original event times. `ingested_at`
@@ -81,8 +83,9 @@ DEFAULT_SCHEMA_DIR = HERE / "schemas" if (HERE / "schemas").is_dir() else REPO_R
 
 PRICES_TOPIC = os.getenv("PRICES_TOPIC", "market.prices.v1")
 FILINGS_TOPIC = os.getenv("FILINGS_TOPIC", "sec.filings.v1")
+TEXT_TOPIC = os.getenv("TEXT_TOPIC", "sec.text.v1")
 
-# Fields each topic carries, in contract order. Both schemas set
+# Fields each topic carries, in contract order. All three schemas set
 # `additionalProperties: false`, so an extra parquet column is a hard failure
 # rather than a passthrough — listing the fields explicitly is what keeps a
 # stray column from ever reaching the wire.
@@ -93,6 +96,11 @@ PRICE_FIELDS = [
 FILING_FIELDS = [
     "schema_version", "cik", "ticker", "accession_no", "form_type", "filed_date",
     "fiscal_period", "period_start", "period_end", "facts", "ingested_at",
+]
+TEXT_FIELDS = [
+    "schema_version", "cik", "ticker", "accession_no", "form_type", "filed_date",
+    "section", "source_document", "title", "text", "chunk_index", "chunk_total",
+    "ingested_at",
 ]
 
 _interrupted = False
@@ -123,7 +131,8 @@ def read_snapshot(path: Path, label: str) -> pd.DataFrame:
         sys.exit(
             f"[producer] no {label} snapshot at {path}\n"
             f"           Fetch it first:  python scripts/fetch_historical_data.py\n"
-            f"                            python scripts/fetch_historical_filings.py"
+            f"                            python scripts/fetch_historical_filings.py\n"
+            f"                            python scripts/fetch_historical_text.py"
         )
     return pd.read_parquet(path)
 
@@ -162,6 +171,20 @@ def filing_events(df: pd.DataFrame) -> list[tuple[datetime, str, str, dict]]:
     return events
 
 
+def text_events(df: pd.DataFrame) -> list[tuple[datetime, str, str, dict]]:
+    """Build (event_time, topic, key, payload) tuples for every press release.
+
+    Keyed by cik, same as sec.filings.v1: they join on it, so both must land on
+    the same partition. Ordered by filed_date, same as the parent filing.
+    """
+    events = []
+    for row in df.to_dict("records"):
+        payload = {field: jsonable(row.get(field)) for field in TEXT_FIELDS}
+        payload["schema_version"] = SCHEMA_VERSION
+        events.append((parse_date(payload["filed_date"]), TEXT_TOPIC, payload["cik"], payload))
+    return events
+
+
 def parse_ts(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
@@ -193,8 +216,8 @@ def split_point(events: list, backfill_days: int, explicit: datetime | None) -> 
 
 
 def build_timeline(snapshot_dir: Path, include_filings: bool = True,
-                   since: datetime | None = None) -> list:
-    """Merge both sources into one non-decreasing sequence of events by event time.
+                   include_text: bool = True, since: datetime | None = None) -> list:
+    """Merge all sources into one non-decreasing sequence of events by event time.
 
     Ties are broken by topic then key so two runs over the same snapshot produce
     byte-identical payloads in an identical order (apart from `ingested_at`).
@@ -224,6 +247,23 @@ def build_timeline(snapshot_dir: Path, include_filings: bool = True,
                 print(f"[producer] note: filings start {gap_years:.0f} years before the first "
                       f"price bar ({filing_start.date()} vs {price_start.date()}). "
                       f"They all land in the backfill window.")
+
+    if include_text:
+        # The text snapshot reaches back to each company's IPO (SEC full-text
+        # archives are cheap to keep on disk), but only the press releases that
+        # land on or after the first price bar have any price bars to join
+        # against. Clipping here, unconditionally, keeps a decade of
+        # unjoinable 1990s press releases out of every replay regardless of
+        # --since; the full archive is still on disk for anyone who wants it.
+        text = read_snapshot(snapshot_path(snapshot_dir, TEXT_TOPIC), "press release")
+        text_rows = text_events(text)
+        total_text = len(text_rows)
+        if price_start is not None:
+            text_rows = [e for e in text_rows if e[0] >= price_start]
+        events.extend(text_rows)
+        print(f"[producer] text   : {len(text_rows):,} of {total_text:,} press releases from "
+              f"{snapshot_path(snapshot_dir, TEXT_TOPIC)} land on or after the first price bar "
+              f"({price_start.date() if price_start else 'n/a'}); the rest predate it and are skipped")
 
     if since is not None:
         before = len(events)
@@ -352,7 +392,11 @@ def main() -> int:
                              "snapshot reaches back to 1994; clipping it to the price window "
                              "gives an evenly paced --speed realtime replay.")
     parser.add_argument("--prices-only", action="store_true",
-                        help="Skip the filings topic. Useful when only the price path is wired up.")
+                        help="Skip the filings and text topics. Useful when only the price path "
+                             "is wired up.")
+    parser.add_argument("--no-text", action="store_true",
+                        help="Skip the text topic but keep filings. Useful when only the "
+                             "sec.text.v1 snapshot is missing.")
     parser.add_argument("--validate-all", action="store_true",
                         help="Validate every message against its schema, not just one of each "
                              "type. Slower; use it when the snapshot format has changed.")
@@ -365,6 +409,7 @@ def main() -> int:
     since = parse_date(args.since) if args.since else None
     events = build_timeline(args.snapshot_dir,
                             include_filings=not args.prices_only,
+                            include_text=not (args.prices_only or args.no_text),
                             since=since)
     if not events:
         sys.exit("[producer] the snapshot contains no events - nothing to replay.")
@@ -402,8 +447,8 @@ def main() -> int:
     # Contract self-check before a single byte goes out: validate the first
     # message of each type. Drifting from the schema should fail here, not days
     # later inside somebody else's Spark job.
-    validators = load_validators(args.schema_dir, [PRICES_TOPIC, FILINGS_TOPIC])
-    for topic in {PRICES_TOPIC, FILINGS_TOPIC}:
+    validators = load_validators(args.schema_dir, [PRICES_TOPIC, FILINGS_TOPIC, TEXT_TOPIC])
+    for topic in {PRICES_TOPIC, FILINGS_TOPIC, TEXT_TOPIC}:
         sample = next((p for _, t, _, p in events if t == topic), None)
         if sample is not None:
             assert_valid(validators, topic, {**sample, "ingested_at": utc_now_iso()})

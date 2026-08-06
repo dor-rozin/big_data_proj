@@ -10,12 +10,12 @@ To actually run the thing end to end with validation at every step, use
 
 | Area | Owner | Status | Notes |
 |---|---|---|---|
-| `producer/` — snapshot replay → Kafka | Amir | Runs end-to-end | Backfill + live modes both verified against a live broker: exact delivery counts, correct partitioning, headers intact. Automated tests / `producers/` layout from ticket 0007 still outstanding |
+| `producer/` — snapshot replay → Kafka | Amir | Runs end-to-end | Backfill + live modes both verified against a live broker: exact delivery counts, correct partitioning, headers intact. Now merges three sources (prices, filings, press-release text). Automated tests / `producers/` layout from ticket 0007 still outstanding |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
-| `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. No automated tests yet |
+| `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
 | `dashboard/` — Streamlit | Person C | Not started | Reads `stock_prices` / `stock_filings` / `stock_context` / `stock_analysis`. Note `stock_news` no longer exists |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
-| `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Contract only | Schema + sample done; producer not written |
+| `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Known gap: joins `sec.filings.v1` by `cik`+nearby `filed_date`, not `accession_no` — filings snapshot doesn't cover `8-K`. See log |
 | Infra — Docker Compose (ticket 0002) | Amir | Done | Verified live 2026-08-04: all acceptance criteria pass. Two real bugs found and fixed — see log |
 | Tests | — | Schema validation only | `scripts/validate_schemas.py`; no framework for the other areas |
 
@@ -29,8 +29,9 @@ add tests for an area; if an area has no row, there is nothing to run for it.
 | Area | Command |
 |---|---|
 | `schemas/` — message contract | `.venv/bin/python scripts/validate_schemas.py` (see README for venv setup) |
-| `producer/` — contract conformance | `.venv/bin/python producer/produce.py --dry-run --validate-all` — loads both snapshots, merges them, validates every message against its schema, sends nothing. Needs no broker. |
-| `producer/` — backfill/live split | `.venv/bin/python producer/produce.py --mode backfill --dry-run` then `--mode live --dry-run`. The two event counts must sum to the full timeline count (3,375 + 2,538 = 5,913 on the current snapshot). |
+| `producer/` — contract conformance | `.venv/bin/python producer/produce.py --dry-run --validate-all` — loads all three snapshots, merges them, validates every message against its schema, sends nothing. Needs no broker. |
+| `producer/` — backfill/live split | `.venv/bin/python producer/produce.py --mode backfill --dry-run` then `--mode live --dry-run`. The two event counts must sum to the full timeline count (3,435 + 2,594 = 6,029 on the current snapshot). |
+| `producer/` — text window clipping | `.venv/bin/python producer/produce.py --dry-run` and read the `[producer] text` line — must read "116 of 1,324" (or whatever the current snapshot's counts are), never all 1,324. Confirms decades of pre-price-window press releases stay on disk and never reach Kafka. |
 | `producer/` — live pacing | `time .venv/bin/python producer/produce.py --mode live --dry-run --duration 4` — should take ~4s with the progress line advancing evenly, not in a burst. |
 | `scripts/verify_stack.sh` | `bash scripts/verify_stack.sh` — needs a running stack. Also `bash -n scripts/verify_stack.sh` for a syntax-only check. |
 | Infra — full live smoke test | `docker compose up -d && bash scripts/verify_stack.sh && docker compose run --rm producer && .venv/bin/python scripts/describe_topics.py --bootstrap localhost:29092` — brings up the whole stack, provisions topics, backfills a year, and prints message counts. |
@@ -1055,3 +1056,62 @@ agrees with them.
 person* would experience, not from testing the code as configured on this
 machine. A working `.env` had been masking a template that crashes on copy. Added
 as a test row above, since it is the first thing anyone new runs into.
+
+### 2026-08-06 — Ticket 0010: filing text producer written and verified live (Amir)
+
+`sec.text.v1` had a frozen schema and a sample message since 0001, but nothing
+produced it — the analyst stage ran on price and filing data alone. This closes
+that gap: press-release text now flows through the same replay producer as
+prices and filings.
+
+**`scripts/fetch_historical_text.py`** (new) walks each of the 10 tickers' `8-K`
+filings via `edgartools`, pulls the `EX-99.1` exhibit where one exists (most
+8-Ks are not earnings releases and have none — no error, just no row), and
+normalises it: strips the `Exhibit 99.1` marker line, collapses blank-line runs
+to one so the text never contains three-or-more consecutive newlines, and takes
+the title from the first surviving line (null, not a truncated sentence, if
+that line exceeds the schema's 300-char limit). Writes one parquet per ticker
+plus `all.parquet` to `historical_data/sec.text.v1.historical/`, same layout as
+the filings fetch.
+
+**Result:** 1,324 press releases across all 10 companies, back to each one's
+IPO — NVDA and AAPL both landed at ~115, JPM (oldest CIK in the set) at 322.
+Three real network/format snags hit along the way, all handled by retrying the
+one bad filing rather than aborting the whole ticker:
+- A handful of pre-2001 filings return SEC's rate-limit page as if it were the
+  document (`'COMPANY DATA'` or a `NoneType.replace` error) — retried with
+  backoff, and the handful that still fail are logged and skipped rather than
+  taking the ticker's other 100+ filings down with them.
+- META hit a real transient network outage for ~30 filings from 2012-2016
+  (`nodename nor servname provided` — DNS resolution failing, not a parsing
+  bug). Confirmed harmless: META's 2024-2026 press releases, the only ones that
+  land in the replay window, are all intact.
+
+**`producer/produce.py`** now merges `sec.text.v1` into the same event-time
+timeline as prices and filings, keyed by `cik` (same partition as the filings
+it's meant to sit near). One deliberate decision: the full archive stays on
+disk, but the timeline builder clips text to `>= first price bar` unconditionally,
+before `--since` or the backfill/live split ever see it — a decade of press
+releases with no price bar to join against would just be noise on every replay.
+On the current snapshot that's 116 of 1,324 messages. Verified with
+`--dry-run --validate-all` (contract self-check passes for all 3 schemas) and
+live: `--mode backfill` against a real broker delivered 3,435/3,435 with 0
+failures, and a consumed message round-tripped `®` and typographic quotes
+intact (schema's stated acceptance criterion).
+
+**Known gap, left open rather than silently worked around:** `sec.filings.v1`
+is only populated from `10-K`/`10-Q` (ticket 0006's scope), not `8-K`, so a
+`sec.text.v1` message's `accession_no` will never be found on `sec.filings.v1`
+— confirmed live, `0001193125-24-204403` (a real MSFT text message's accession)
+is absent from the 875 filings on the topic. The two topics still join, just on
+`cik` + nearby `filed_date` rather than `accession_no` as `schemas/README.md`
+allows for. Extending the filings fetch to cover `8-K` would close this
+properly; not done here to avoid changing the already-verified filings
+snapshot's scope and counts.
+
+**Not verified:** the Spark side reading real (not hand-loaded) `sec.text.v1`
+messages end to end — `spark/` already has `TEXT_SCHEMA` wired in from the
+2026-08-05 rebuild, but hasn't been re-run since real messages landed on the
+topic. `.claude/0010-filing-text-producer.md` marked `in-progress`, not `done`,
+for this reason and the file-layout deviation (`scripts/` + `produce.py`
+instead of a standalone `producers/text_producer.py`) — see `.claude/index.md`.

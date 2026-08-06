@@ -142,8 +142,8 @@ first price bar plus `BACKFILL_DAYS` (365) — and each mode takes one side:
 | Seed history | `producer` | `--mode backfill` | before the split | `instant` |
 | Simulate live | `producer-live` | `--mode live` | at/after the split | `realtime`, over `REPLAY_DURATION` |
 
-With the current snapshot the split falls on **2025-08-05**: 3,375 events
-backfilled, 2,538 streamed live.
+With the current snapshot the split falls on **2025-08-05**: 3,435 events
+backfilled, 2,594 streamed live.
 
 This is one tool with a mode flag rather than two scripts for one reason: both
 sides read the *same* boundary out of `.env`, so they are provably
@@ -151,11 +151,11 @@ complementary — no message is sent twice and none is skipped. Two separately
 configured producers drift the moment somebody changes one and not the other.
 If you change `BACKFILL_DAYS`, change it in `.env` and both jobs follow.
 
-Within each job, price bars and filings are merged into one sequence ordered by
-**event time**, so a filing lands between the price bars that surround it
-chronologically. Replay speed changes *when* messages are sent, never the
-timestamps inside them: `ts` and `filed_date` stay at their original event
-times, and `ingested_at` records the real send time.
+Within each job, price bars, filings, and press releases are merged into one
+sequence ordered by **event time**, so a filing (or its text) lands between the
+price bars that surround it chronologically. Replay speed changes *when*
+messages are sent, never the timestamps inside them: `ts` and `filed_date` stay
+at their original event times, and `ingested_at` records the real send time.
 
 ```bash
 # Slower/faster live stream (default 300s for the whole live year).
@@ -256,22 +256,26 @@ filings replaced news headlines. The text is the `EX-99.1` exhibit of an earning
 8-K, which is filed the day before the matching 10-Q — so it lands on the day the
 stock actually reacts, and joins to a price anomaly by date.
 
-`market.prices.v1` and `sec.filings.v1` are wired into the run steps above:
-`topic-init` creates them and the producer writes to them.
+All three topics are wired into the run steps above: `topic-init` creates them
+and the producer writes to them. `scripts/fetch_historical_text.py` pulls the
+`EX-99.1` press release from every 8-K back to each company's IPO (~1,300
+messages across the 10-ticker universe) into
+`historical_data/sec.text.v1.historical/`. Only the ones filed on or after the
+first price bar are ever replayed into Kafka — a decade of press releases with
+no price bar to join against would just be noise — so a normal run puts roughly
+100-120 `sec.text.v1` messages on the topic, not 1,300. The full archive stays
+on disk for anyone who wants a wider window later.
 
-**The Spark job reads all three topics against the frozen contract.**
-`sec.text.v1` is created but has no producer yet (ticket 0010), so the analyst
-stage currently runs on price and filing data alone and says so — the generated
-notes flag the missing narrative text as a stated limitation and lower their own
-confidence accordingly. Nothing needs changing on the Spark side when that
-producer lands; the text path is already built. To exercise it in the meantime,
-load the sample message by hand:
+**Known join gap:** `sec.filings.v1` is only populated from `10-K`/`10-Q`
+filings (`scripts/fetch_historical_filings.py`), not `8-K`, so a `sec.text.v1`
+message's `accession_no` will not be found on `sec.filings.v1` — the two topics
+join by `cik` + nearby `filed_date` instead, not `accession_no`. Extending the
+filings fetch to include `8-K` would close this gap but was left out of this
+pass to avoid changing the already-verified filings snapshot's scope.
 
-```bash
-docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
-  --bootstrap-server localhost:9092 --topic sec.text.v1 \
-  < schemas/samples/sec.text.v1.json
-```
+**The Spark job reads all three topics against the frozen contract** and was
+previously verified against a hand-loaded sample message; it has not yet been
+re-run against the real producer output above.
 
 ## Configuration (`.env`)
 
@@ -284,7 +288,7 @@ the ones you are most likely to change:
 | `KAFKA_BOOTSTRAP_HOST` | Broker address for clients on the **host** (`localhost:29092`)        |
 | `PRICES_TOPIC`         | Price bar topic — `market.prices.v1`, frozen by the contract           |
 | `FILINGS_TOPIC`        | Filings topic — `sec.filings.v1`, frozen by the contract               |
-| `TEXT_TOPIC`           | Filing text topic — `sec.text.v1`, no producer yet                     |
+| `TEXT_TOPIC`           | Filing text topic — `sec.text.v1`, 8-K press releases                  |
 | `TOPIC_PARTITIONS`     | Partitions per topic (3). Cannot be lowered after creation             |
 | `TOPIC_RETENTION_MS`   | `-1` = keep forever, so replay-from-earliest always works              |
 | `BACKFILL_DAYS`        | Width of the backfill window in days (365). **Read by both producer jobs** — this is the shared split |
@@ -516,9 +520,10 @@ rather than zero, and to lower its stated confidence when the data is thin.
 Price data from Yahoo Finance via the open-source
 [`yfinance`](https://github.com/ranaroussi/yfinance) library. Filing data and
 text from the U.S. SEC's public [EDGAR](https://www.sec.gov/edgar) XBRL
-company-facts API. Both were captured once into `historical_data/` by
-`scripts/fetch_historical_data.py` and `scripts/fetch_historical_filings.py`;
-the pipeline replays those files rather than calling either source at run time.
+company-facts and full-text search APIs. All three were captured once into
+`historical_data/` by `scripts/fetch_historical_data.py`,
+`scripts/fetch_historical_filings.py`, and `scripts/fetch_historical_text.py`;
+the pipeline replays those files rather than calling any source at run time.
 
 Analyst notes are generated by Google's
 [Gemini API](https://ai.google.dev/) free tier. For educational use only — the
