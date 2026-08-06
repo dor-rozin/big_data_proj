@@ -5,16 +5,22 @@ Guidance for Claude Code when working in this repository.
 ## Project
 
 End-to-end big data pipeline for the BIU Big Data course:
-`yfinance → Kafka → Spark (features + MLlib KMeans anomaly detection + VADER sentiment) → Elasticsearch → Streamlit`
+`snapshot replay → Kafka → Spark (transform + MLlib KMeans anomalies) → LLM analyst → Elasticsearch → Streamlit`
 
-See [README.md](README.md) for the architecture diagram and run instructions,
-and [so_far.md](so_far.md) for who has done what.
+See [README.md](README.md) for the architecture and design rationale,
+[RUNBOOK.md](RUNBOOK.md) to run it end to end with validation at every step, and
+[so_far.md](so_far.md) for who has done what.
 
-| Folder      | Stage                                     |
-|-------------|-------------------------------------------|
-| `producer/` | Ingest: yfinance → Kafka                  |
-| `spark/`    | Transform + anomaly detection + ES load   |
-| `dashboard/`| Streamlit dashboard                       |
+| Folder      | Stage                                                        |
+|-------------|--------------------------------------------------------------|
+| `producer/` | Ingest: parquet snapshot replay → Kafka (backfill + live)     |
+| `schemas/`  | The frozen Kafka message contract — 3 topics                  |
+| `spark/`    | Transform + MLlib anomalies + LLM analyst + Elasticsearch load |
+| `dashboard/`| Streamlit dashboard                                           |
+
+The message contract in [schemas/README.md](schemas/README.md) is **frozen**.
+Changing a field there changes the Spark `StructType`s and the Elasticsearch
+mappings downstream, so it is a conversation with the whole team, not a commit.
 
 ## Definition of Done
 

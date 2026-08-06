@@ -3,15 +3,17 @@
 Running record of what is done, so everyone knows where the project stands.
 Updated whenever someone declares a piece of work done (see [CLAUDE.md](CLAUDE.md)).
 
+To actually run the thing end to end with validation at every step, use
+[RUNBOOK.md](RUNBOOK.md).
+
 ## Current status
 
 | Area | Owner | Status | Notes |
 |---|---|---|---|
 | `producer/` — snapshot replay → Kafka | Amir | Runs end-to-end | Backfill + live modes both verified against a live broker: exact delivery counts, correct partitioning, headers intact. Automated tests / `producers/` layout from ticket 0007 still outstanding |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
-| `spark/` — transform + KMeans anomaly detection | Person B | Code written, not verified | Not yet run end-to-end or tested |
-| `spark/` — Elasticsearch load | Person C | Code written, not verified | Not yet run end-to-end or tested |
-| `dashboard/` — Streamlit | Person C | Code written, not verified | Not yet run end-to-end or tested |
+| `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. No automated tests yet |
+| `dashboard/` — Streamlit | Person C | Not started | Reads `stock_prices` / `stock_filings` / `stock_context` / `stock_analysis`. Note `stock_news` no longer exists |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
 | `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Contract only | Schema + sample done; producer not written |
 | Infra — Docker Compose (ticket 0002) | Amir | Done | Verified live 2026-08-04: all acceptance criteria pass. Two real bugs found and fixed — see log |
@@ -34,6 +36,14 @@ add tests for an area; if an area has no row, there is nothing to run for it.
 | Infra — full live smoke test | `docker compose up -d && bash scripts/verify_stack.sh && docker compose run --rm producer && .venv/bin/python scripts/describe_topics.py --bootstrap localhost:29092` — brings up the whole stack, provisions topics, backfills a year, and prints message counts. |
 | `scripts/create_topics.py` — drift detection | Manually set a topic's `retention.ms` (`docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type topics --entity-name <topic> --add-config retention.ms=604800000`), re-run `create_topics.py`, confirm it reports the drift and exits 0. |
 | `scripts/reset_stack.sh` | `bash scripts/reset_stack.sh --seed` — confirm the volumes are actually recreated (`docker volume ls` before/after) and the re-seed delivers the same 3,375/3,375 with 0 failed. |
+| `spark/` — full pipeline, no API key | `LLM_ENABLED=false docker compose --profile jobs run --rm spark` — runs stages 1, 2, 2b, 3 and 5. Needs a running stack with the backfill loaded; needs no Gemini key. |
+| `spark/` — full pipeline with the analyst | `docker compose --profile jobs run --rm spark` — as above plus the LLM stage. ~1 min on Groq. Expect 10 reports in `./llm_output/` and a spread of recommendations, not 10 identical ones. |
+| `spark/` — idempotency | Run the pipeline twice, then check the counts did not change: `curl -s localhost:9200/stock_prices/_count`. Deterministic `_id`s make the load an upsert, so a second run must leave 2,500 / 875 / 10, not double them. |
+| `spark/` — analyst context capture | `docker compose --profile jobs run --rm -e LLM_ENABLED=false spark` then `curl -s localhost:9200/stock_context/_count` — must be 10, and `ls llm_output/_prompts/` must hold 10 files. Costs no API quota; this is the check to run while iterating on the prompt. |
+| Full stack — clean end-to-end run | Follow [RUNBOOK.md](RUNBOOK.md) top to bottom. It states the expected output for every step, so a mismatch anywhere is the failure point. Ends with an idempotency check. |
+| `spark/` — provider chain | `docker compose --profile jobs run --rm spark`. The banner shows the chain (`groq -> gemini`), and the closing `produced by:` line names which model wrote each analysis. Every row in `stock_analysis` must carry `provider_used`. |
+| `spark/` — fallback triggers | Force a retirement and confirm the run still finishes: `-e GROQ_API_KEY=bad` (auth → retire on row 1, all rows via the fallback), or `-e LLM_FALLBACK_PROVIDERS=ollama` without starting the container (unreachable → retire, no fallback left, rows recorded as failures). Neither may hang. |
+| `spark/` — schema-drift guard | Rename a field in a `StructType` in `spark/schemas.py` (e.g. `ts` → `date`) and re-run. `assert_parsed` must fail naming the topic, rather than the job exiting 0 having produced nothing. |
 | everything else | No test framework is set up. No `tests/` directory and no test dependency in `producer/`, `spark/`, or `dashboard/` requirements. |
 
 ## Log
@@ -633,3 +643,374 @@ stop the containers. The `kafka-data`/`es-data` volumes are untouched — one
 year of backfilled history (2,500 price bars, 875 filings) is still sitting in
 them, confirmed via `docker volume ls`. Next `docker compose up -d` picks up
 right where this session left off; nothing is running in the meantime.
+
+### 2026-08-05 — Spark half rebuilt on the frozen contract: tabular → MLlib → Gemini → Elasticsearch (Dor)
+
+Replaced the yfinance/VADER-era `spark/pipeline.py` with a five-stage job built
+against the frozen contract, split across small modules. Verified live against a
+running stack, not just written.
+
+**The design decision worth recording: MLlib and the LLM are not two independent
+AI features, they are one pipeline.** KMeans finds *where to look*, Gemini says
+*what it means*. An LLM cannot scan thousands of price bars or do arithmetic over
+them, so without the anomaly stage the prompt carries a coarse average and the
+note reads the same for every company. With it, the prompt names specific unusual
+days with specific numbers. Anomaly detection was briefly cut from the plan as
+"a dressed-up outlier filter" — true as a standalone output, wrong as a feature
+extractor, which is why it came back.
+
+- `spark/schemas.py` — the three contract `StructType`s, plus `assert_parsed`,
+  which fails loudly when messages arrive but every key field is null. That is
+  the `from_json` trap: a drifted schema does not raise, it nulls the column, and
+  a downstream `dropna` then clears every row while the job exits 0.
+- `spark/transforms.py` — prices (time-based `rangeBetween` windows, not
+  row-based), filings (19 facts flattened, restatements deduped by
+  `max(filed_date)` per `(cik, fiscal_period, period_end)`, null-safe ratios),
+  text (chunk reassembly by `accession_no` + `section`), and the per-ticker
+  aggregate.
+- `spark/anomaly.py` — z-score **per `(ticker, interval)` group**, then **one**
+  KMeans across all groups. Per-group scaling is what makes it meaningful (on a
+  global scale NVDA's volatility would define "normal" and JPM would never look
+  unusual); a single fit is what makes it scale (one model per ticker is N Spark
+  jobs). This replaces MLlib's `StandardScaler`, which standardises globally and
+  would undo the per-group scaling.
+- `spark/llm.py` — Gemini client. Deliberately **not** a Spark UDF: a UDF runs on
+  executors with no shared rate limiting, and a failed task re-runs the whole
+  partition, re-issuing calls that already cost quota.
+- `spark/es_writer.py` — streamed via `toLocalIterator()`, never `toPandas()`;
+  create-if-missing instead of delete-and-recreate; deterministic `_id`s.
+- `spark/prompts/analyst.md` — the prompt, loaded at runtime so tuning it is not
+  a code change.
+
+**Verified live 2026-08-05.** 2,500 price bars + 875 filings + 1 text document →
+130 anomalies (13 per ticker, exactly 5% of 250 bars each, so the per-group
+threshold is working) → 10 analyst notes → `stock_prices` 2,500 /
+`stock_filings` 875 / `stock_analysis` 10. Ran twice; counts unchanged, which
+confirms the deterministic ids make the load an upsert rather than an append.
+
+**Finding — Gemini's free tier limits both rate *and* daily volume, and both
+were hit.** The first run set `LLM_CONCURRENCY=4`, which exhausted the
+per-minute window instantly; all four workers then retried into the same wall on
+a 1–4s backoff, far too short for a per-minute quota, and 8 of 10 failed. Fixed
+three ways: default concurrency dropped to 1, a cross-thread `Pacer` spaces calls
+≥13s apart, and a 429 now reads the server's own `retryDelay` instead of the
+generic exponential backoff. The second run got 10 of 10 in ~2.5 min.
+
+A third run the same day then failed 6 of 10 *with the pacing applied*, which
+rules out the per-minute limit as the only constraint — **there is also a daily
+cap, and roughly 30 calls exhausted it.** Practical consequence for anyone
+demoing this: the analyst stage is good for about two full runs per day on one
+key. Iterate on the Spark stages with `LLM_ENABLED=false` and save the quota for
+the real run. Switching `GEMINI_MODEL` to a different model also switches quota
+bucket, which is the other way out.
+
+**This is the argument for aggregating before the LLM stage stated in numbers** —
+at one call per row instead of one per ticker, this dataset would need 3,375
+calls, which is beyond the daily quota by two orders of magnitude.
+
+**Two defects the quota exhaustion exposed, both now fixed.** Neither was
+visible while every call succeeded:
+
+- *A failed analysis upserted an empty document over a good one.* The
+  Elasticsearch `_id` is `ticker|interval|as_of`, so a failure later the same day
+  overwrote a successful analysis written earlier that day — the retry destroyed
+  the results it was meant to add to. `write_analyses` now skips failed rows
+  entirely and reports which ones it skipped, leaving the earlier document intact.
+- *Stale `.txt` reports masqueraded as current.* `write_reports` skipped
+  failures, so the previous run's file stayed on disk with no marker saying it was
+  old, sitting indistinguishably beside fresh ones. It now removes the stale file
+  for any ticker that failed, so the directory always reflects the current run.
+
+**Finding — the model caught a real data inconsistency we had not noticed.** The
+AAPL note flagged a "data timeline mismatch between price history ending August
+2025 and press release filing text dated July 2026". Correct: the backfill cuts
+prices at 2025-08-04, but `schemas/samples/sec.text.v1.json` is Apple's July 2026
+press release. Harmless while the text topic holds one hand-loaded sample; worth
+watching once ticket 0010 produces text across the whole window.
+
+**`sec.text.v1` is still effectively empty** (ticket 0010 `todo`), so 9 of 10
+notes have no narrative text. The notes handle this honestly rather than
+hallucinating around it — they name the absence as a stated limitation and report
+`confidence: low`. Nothing on the Spark side needs changing when the producer
+lands; the text path is already built and exercised against the sample.
+
+**Project direction changed, and the README now says so.** The AI capability is
+no longer MLlib alone, `stock_news` and the VADER dependency are gone, three
+indices replace two, and the "no paid APIs, no keys" claim is retired — the
+infrastructure is still fully local and free, but the analyst stage calls a
+hosted API. `LLM_ENABLED=false` runs everything else without a key.
+
+**Not done:** no automated tests (the "How to test" rows above are all manual),
+and `dashboard/app.py` still reads the old `stock_news` index — that is Person C's
+work and they have not started, so the new index names were chosen without
+needing to coordinate.
+
+### 2026-08-05 — Stage 3b: the analyst context is now inspectable (Dor)
+
+**Problem it fixes:** the stage-3 aggregate — the single row per instrument that
+the LLM actually reasons over — was assembled in memory, handed to Gemini, and
+discarded. Every other stage's output could be inspected in Elasticsearch or
+kafka-ui; the one thing you could not see was what the model was shown, which is
+the first thing you want when an answer looks wrong.
+
+Two artifacts, both produced **before** the API call and **regardless of whether
+one happens**:
+
+- `stock_context` index — the aggregate as queryable fields (bar counts, the
+  top-5 anomalies as a nested array, anomaly-near-filing counts, latest facts and
+  ratios, `filing_text_available`), plus `context_json` holding the literal blob
+  embedded in the prompt. Stored with `index: false` so it is retrievable without
+  bloating the search index.
+- `llm_output/_prompts/TICKER.txt` — the exact prompt string.
+
+**Both are built by the same `build_prompt()` the API call uses.** An inspection
+artifact that is merely *similar* to the real request is worse than none, because
+it invites debugging text that was never sent.
+
+**Why this matters more than it looks, given the daily quota.** Prompt assembly
+costs nothing, so `spark/prompts/analyst.md` can be iterated on and verified with
+`LLM_ENABLED=false` as many times as needed, and the ~2 runs/day of quota spent
+only on a prompt already known to be right. Before this, checking a prompt change
+meant spending a call to find out.
+
+**Verified 2026-08-05 with `LLM_ENABLED=false`** (deliberately — the run that
+proves the feature should be the run that needs no quota): 10 prompts dumped, 10
+context documents indexed, `stock_prices` and `stock_filings` unchanged at
+2,500 / 875. NVDA's context shows 13 anomalies with the 2025-01-27 −16.97% /
+3.11× volume day ranked first, `revenue_yoy` +69.2%, and a 4,331-character prompt.
+
+**Also surfaced as a queryable field:** `filing_text_available` is `false` for 9
+of 10 instruments. Ticket 0010's absence is now a single query over
+`stock_context` rather than something you notice by reading the notes.
+
+**Four indices now**, so Person C's dashboard reads `stock_prices`,
+`stock_filings`, `stock_context`, `stock_analysis`.
+
+### 2026-08-05 — Analyst stage made provider-switchable; Groq added (Dor)
+
+Gemini's free-tier daily cap made iteration impractical — roughly two full runs
+before it starts refusing. Added `LLM_PROVIDER=groq|gemini` rather than swapping
+one for the other, so the project keeps both.
+
+**Only the transport differs.** Two small functions per provider — build the
+request, extract the text — behind a dispatch table. The prompt, the context
+builder, the JSON contract, the pacer, the retry policy, the report writer and
+both Elasticsearch indices are shared. Groq speaks the OpenAI chat-completions
+dialect, so a third provider would be a near-copy of the Groq pair.
+
+Per-provider defaults live in `pipeline.py`: key, model, and a pacing interval
+(1s for Groq, 13s for Gemini). `LLM_MIN_INTERVAL_SECONDS` overrides both; left
+empty, each provider gets the right value.
+
+| | Groq | Gemini |
+|---|---|---|
+| Ten instruments | **65s, 10/10** | ~2.5 min, quota-blocked at 4/10 |
+| Free tier | generous | ~5 req/min *and* ~30 calls/day |
+
+**Finding — the Cloudflare 403 that looks like an auth failure.** Groq returned
+`HTTP 403: error code: 1010` on every call while the same key worked fine from
+`curl`. That is Cloudflare rejecting `urllib`'s default `Python-urllib/3.11`
+User-Agent, not Groq rejecting the key. Isolated it by sending one request each
+way from inside the container: default UA → 403, explicit UA → 400 from Groq
+itself (a real API complaint about the test payload, i.e. the request had
+arrived). Fixed by setting a `User-Agent` header on every request. Worth knowing
+before adding a third provider — nothing in the error names the real cause.
+
+**Finding — the model answered `hold` for all ten instruments**, where Gemini
+had produced a spread on identical data. The notes were factually sound; the
+`recommendation` field was simply dead — nothing for the dashboard to filter,
+group or chart on. The model said why in its own summary: *"the data does not
+strongly support a buy or sell recommendation."*
+
+The cause was a prompt gap, not a model defect: `recommendation` and
+`confidence` were not distinguished, so uncertainty was being expressed as
+`"hold"`. Added rule 6 making the split explicit — `recommendation` is the
+direction the evidence leans, `confidence` is how much that direction can be
+trusted, and thin data means `confidence: low`, never `"hold"`. `"hold"` is
+reserved for genuinely conflicting signals, and the `signals` list must support
+whatever recommendation was given.
+
+**Result on identical data: 10/10 `hold` became 7 buy / 2 hold / 1 sell.** The
+two remaining `hold`s are BRK.B and JPM — the two whose data genuinely
+conflicts (BRK.B's net income fell 59% YoY; JPM is the bank with 10 of 19 facts
+structurally null). TSLA's `sell` cites a revenue decline of 11.78%, net income
+down 20.7%, and a close below its 30-day moving average, at `confidence: low`
+for the missing filing text. Direction and certainty are now separate fields
+doing separate jobs.
+
+**Worth remembering for the demo:** this is the clearest example in the project
+of prompt design mattering as much as model choice. The same model on the same
+data produced a useless field and then a useful one, with no code change — only
+`spark/prompts/analyst.md`. The prompt-dump artifacts from stage 3b are what
+made testing that change free.
+
+### 2026-08-06 — `RUNBOOK.md` added (Dor)
+
+The project had a README describing what the pipeline *is* and a work log
+describing who built what, but nothing describing how to run it from a clean
+machine and confirm each stage actually did its job. Verifying a run meant
+reconstructing the commands from memory.
+
+`RUNBOOK.md` is the missing piece: teardown → up → verify → producer → Spark,
+with the **expected output and a validation command after every step**, so a
+mismatch localises the failure instead of surfacing as a wrong number three
+stages later. It doubles as the demo script.
+
+Two things it captures that repeatedly caused confusion:
+
+- **kafka-ui shows an empty Messages pane on a full topic** unless Seek Type is
+  set to Oldest — the backfill has finished, so a newest-first view has nothing
+  to show.
+- **Partitions come out uneven (1000/1500/0) and that is correct.** Messages are
+  keyed by `ticker`, so each ticker hashes to one partition and ten tickers over
+  three partitions cannot balance. It is the ordering guarantee working, not skew
+  to fix.
+
+It also documents the Elasticsearch/filesystem split, which is easy to
+misread: **Elasticsearch holds JSON documents only.** The `.txt` files under
+`llm_output/` are on the host, and duplicate nothing — `llm_output/TICKER.txt`
+is `stock_analysis` rendered for reading, and `llm_output/_prompts/TICKER.txt`
+is the `context_json` field of `stock_context` wrapped in the prompt template.
+Files for reading, indices for querying.
+
+**Gotcha the runbook now documents:** `_cat/indices` reports `stock_context` as
+**60 documents when there are 10**. `top_anomalies` is a `nested` field, so
+Elasticsearch stores each anomaly as its own hidden Lucene document — 10 parents
+x (1 + 5 anomalies) = 60. `_cat/indices` counts Lucene docs, `_count` counts real
+ones. Caught while writing the runbook, which had been telling readers to expect
+10 from the command that returns 60; every count check now uses `_count`. The
+other three indices have no nested fields, so both agree on them and nothing
+looked wrong until this index existed.
+
+Linked from `README.md` (ahead of the quick-start) and from the top of this file.
+
+### 2026-08-06 — Two bugs found by running the runbook end to end (Dor)
+
+Ran `RUNBOOK.md` top to bottom to verify the commands as written. Steps 0-5
+matched exactly. **Step 6 hung for an hour**, and finding out why exposed two
+defects that had been present since the analyst stage was written.
+
+**Bug 1 — an unbounded `retry-after` sleep.** On a 429 the client honoured
+whatever wait the provider asked for. Groq, on an exhausted daily budget, asks
+for **606 seconds**. With five retries across ten instruments that is hours of
+sleeping, and the job looks hung because it *is* — just deliberately.
+
+Fixed with `MAX_BACKOFF = 60`: past that ceiling the instrument fails with a
+message naming the requested wait, and the run continues. Nine analyses plus one
+recorded failure beats an hour of silence. Pacing cannot help here — pacing
+solves a per-minute rate, and this is a daily budget.
+
+**Bug 2 — Python block-buffers stdout when it is a pipe**, so
+`docker compose run ... | grep` held every stage banner in an 8 KB buffer until
+exit. Meanwhile the JVM's log4j output kept arriving on stderr, so the console
+showed *activity* while the pipeline's own progress was invisible. That is what
+turned a diagnosable stall into an hour of guessing: the client was printing
+"rate limited, waiting 606s" the whole time and none of it reached the terminal.
+Fixed with `ENV PYTHONUNBUFFERED=1` in `spark/Dockerfile`, plus `flush=True` on
+the retry message.
+
+Bug 2 is the more instructive one. Bug 1 was a bad default; bug 2 is why it took
+an hour to find a bad default.
+
+**Finding — Groq's free tier meters TOKENS, not requests: 100,000 per day.**
+Earlier notes called it "generous" against Gemini's ~30 calls/day, which was
+right in spirit and wrong in units. A ten-instrument run costs ~13k tokens
+(~1.2k per prompt, ~3.4k for the one carrying filing text), so the real budget is
+**about seven runs per day**. Today's testing used 99,343 of 100,000.
+
+`.env.example`, `README.md` and `RUNBOOK.md` now state the token figure rather
+than describing the tier as generous.
+
+**Correction — the jar download is not slow, and an earlier note in this log
+saying so was wrong.** Two runs took far longer than expected and both were
+attributed to `docker compose down -v` wiping the `spark-ivy` volume, forcing a
+Kafka-connector re-download. Measured properly: a cold run with the cache wiped
+takes **32s**, warm **23s**. The jar is 112 MB and costs about nine seconds.
+
+Both slow runs were the analyst stage. The first was Gemini's 13s pacing (130s
+minimum for ten instruments) plus 30s retry backoffs; the second was the 606s
+`retry-after` bug above. Diagnosing by `-e LLM_ENABLED=false` separates the two
+in one command: ~30s means the Spark half is fine and the time is API waits.
+
+The runbook now carries measured timings rather than an estimate.
+
+**Verified after the fixes:** the run that would have hung for an hour instead
+completed in ~1 minute, wrote the one analysis that succeeded, removed the nine
+stale reports, and left no empty documents over good ones. Stages 1, 2, 2b, 3, 3b
+and 5 all produced their expected counts (2,500 / 875 / 10). Only
+`stock_analysis` is short, which is the correct behaviour with no budget left.
+
+**Not yet verified:** a clean end-to-end run with all ten analyses, because the
+token budget is spent. The Spark half is unaffected — that path ran correctly
+four separate times today.
+
+### 2026-08-06 — Analyst stage given a provider chain with a local fallback (Dor)
+
+Both hosted free tiers can be exhausted in a working day, and an exhausted
+provider mid-demo previously meant no analyses at all. The stage now takes an
+ordered chain rather than a single provider.
+
+```
+LLM_PROVIDER=groq
+LLM_FALLBACK_PROVIDERS=gemini          # or gemini,ollama
+```
+
+Adding `ollama` was cheap because it speaks the OpenAI chat-completions dialect,
+the same as Groq — the provider table takes two small functions per entry and
+everything else is shared. It runs behind the `local-llm` compose profile with a
+persistent volume for pulled models.
+
+**The design question was what should make the chain move**, and the answer split
+into two classes:
+
+*Provider retired for the whole run* — every remaining row skips it:
+budget exhausted (a 429 asking for longer than the 60s ceiling), auth rejected
+(401/403), unreachable host, or **two consecutive row failures**.
+
+*Row-level, provider stays in play* — malformed JSON, a one-off 5xx, a timeout.
+
+The consecutive-failure rule exists because not every exhausted provider
+announces itself with one long wait. Groq says "1362s" and is trivially
+detected; Gemini's per-minute limit returns 25-46s delays, all under the ceiling,
+so without the rule every row retried four times, failed, and the provider was
+never retired.
+
+**Then a second, subtler mistake, found by measuring rather than reasoning.**
+With the consecutive-failure rule in place a doomed run still took over ten
+minutes: two rows x five retries x up-to-60s backoffs before retirement ever
+fired. The rule was right and the retry budget was wrong.
+
+**Retries are for when there is nowhere else to go.** With a fallback still
+available the client now retries twice and hands the row over; only as the last
+resort does it retry five times. Grinding through five attempts against a
+provider that is already refusing reaches the same outcome minutes later.
+
+**Verified live, and better than the failure case we were testing for.** The run
+that proved it was not a doomed one: Groq served 9 of 10 instruments, hit its
+*per-minute* token limit on MSFT (TPM 12,000), failed over to Gemini in seconds,
+and MSFT came back `buy`. **10/10 analyses in 64 seconds**, closing line
+`produced by: gemini x1, groq x9`. The fallback is not just insurance against a
+dead provider — it absorbs ordinary rate-limit turbulence mid-run.
+
+**Provenance is now recorded**, because it has to be: `provider_used` and
+`model_used` on every `stock_analysis` document and at the head of every `.txt`.
+A note from a 3B local model and one from a 70B hosted model are not
+interchangeable and the index must not imply otherwise.
+
+**Documentation gap found while verifying:** `RUNBOOK.md` said to expect 10
+documents in `stock_context` and `stock_analysis`, but their `_id` carries
+`as_of`, so each day keeps its own set — 20 and 20 on day two, by design, since
+Tuesday's view of an instrument does not replace Monday's. `stock_prices` and
+`stock_filings` are keyed on the data itself and stay flat. The runbook now says
+so and gives a date-scoped count for checking today's set.
+
+**Answering a question that came up: Spark MLlib has no LLM.** It is classical ML
+— clustering, classification, regression, and feature transformers like
+`Word2Vec`, `HashingTF` and `LDA`. Those produce vectors and topics, not
+generated text, and there is no LLM connector. Spark NLP (John Snow Labs) is the
+third-party library that runs transformers distributed on Spark, but it targets
+classification and NER rather than note generation, and it is a heavy dependency.
+Keeping the LLM outside Spark is also the right call independently: ten HTTP
+calls belong on the driver where pacing and retries are controllable, not spread
+across executors where a failed task re-runs a partition and re-issues calls that
+already cost quota.

@@ -252,6 +252,38 @@ services:
     init: true
     volumes:
       - spark-ivy:/root/.ivy2   # cache the Kafka connector jar between runs
+      # Analyst notes land on the host so they survive the container exiting.
+      - ./llm_output:/app/llm_output
+
+  # ===========================================================================
+  # Local LLM fallback. Only starts with --profile local-llm.
+  #
+  #   docker compose --profile local-llm up -d ollama
+  #   docker compose --profile local-llm exec ollama ollama pull llama3.2:3b
+  #
+  # Exists so the analyst stage survives an exhausted hosted quota or a dead
+  # network. It is deliberately NOT the default: Docker on macOS cannot pass
+  # through the GPU, so inference is CPU-bound at roughly 30-60s per instrument
+  # against Groq's sub-second. Insurance, not the everyday path.
+  #
+  # Needs ~4 GB of RAM on top of the rest of the stack. Raise Docker Desktop's
+  # memory to 10-12 GB before enabling it.
+  # ===========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    profiles: ["local-llm"]
+    networks: [pipeline]
+    restart: unless-stopped
+    ports:
+      - "11434:11434"   # host access, for pulling models and poking at it
+    volumes:
+      - ollama-models:/root/.ollama   # keep pulled models across restarts
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   # ===========================================================================
   # Streamlit dashboard, reading Elasticsearch. http://localhost:8501
@@ -275,6 +307,7 @@ networks:
     driver: bridge
 
 volumes:
+  ollama-models:
   kafka-data:
   es-data:
   spark-ivy:
