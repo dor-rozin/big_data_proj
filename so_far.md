@@ -15,7 +15,7 @@ To actually run the thing end to end with validation at every step, use
 | `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
 | `dashboard/` — Streamlit | Person C | Not started | Reads `stock_prices` / `stock_filings` / `stock_context` / `stock_analysis`. Note `stock_news` no longer exists |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
-| `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Known gap: joins `sec.filings.v1` by `cik`+nearby `filed_date`, not `accession_no` — filings snapshot doesn't cover `8-K`. See log |
+| `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Joins `sec.filings.v1` by `cik` + `filed_date` window, **never** `accession_no` (0 shared accessions — contract corrected 2026-08-06, see log) |
 | Infra — Docker Compose (ticket 0002) | Amir | Done | Verified live 2026-08-04: all acceptance criteria pass. Two real bugs found and fixed — see log |
 | Tests | — | Schema validation only | `scripts/validate_schemas.py`; no framework for the other areas |
 
@@ -1162,3 +1162,66 @@ message's `accession_no` will never match a filings row. The Spark aggregate is
 unaffected — it joins text to prices by `ticker` and date, never by
 `accession_no` — but `schemas/README.md` still advertises `accession_no` as the
 join key between those two topics, and that join would return nothing today.
+
+### 2026-08-06 — Contract corrected: the two SEC topics never join on `accession_no` (Amir)
+
+Dor raised that `schemas/README.md` advertises an `accession_no` join between
+`sec.filings.v1` and `sec.text.v1` that returns nothing. **Confirmed, and it is
+worse than "a gap": the overlap is exactly zero and always will be.** An
+accession number identifies one specific filing; the filings topic carries
+`10-K`/`10-Q` and the text topic carries the `EX-99.1` of an `8-K`. Different
+documents, different days, different accessions — by definition. Measured on the
+snapshot: 913 filings, 1,324 text docs, **0 shared**. It fails silently, so the
+symptom is a blank dashboard panel, not an error.
+
+**Dor's proposed fix — add `8-K` to the filings snapshot so the accessions line
+up — I investigated and rejected, because the premise turned out to be false.**
+It was a reasonable read of the contract; the contract was just wrong. This file
+claimed "Apple's earnings-release 8-Ks carry 569 facts," implying 8-Ks belonged
+on the filings topic. Measuring it:
+
+| ticker | 8-Ks we have text for | of those, carrying XBRL facts |
+|---|---|---|
+| AAPL | 116 | 2 (2%) |
+| MSFT | 190 | 3 (2%) |
+| JPM | 322 | 0 |
+
+The 569-fact example traces to accession `0001193125-15-023732` — a **2015**
+filing. Modern earnings 8-Ks don't attribute XBRL facts to the 8-K accession, so
+the claim was true once and quietly stopped being true. Adding `8-K` to the
+filings topic would therefore append ~1,324 rows of which ~98% carry entirely
+null facts — and `fiscal_period` is a required, non-nullable enum whose XBRL `fp`
+source is empty even on the 8-Ks that *do* carry facts, so every one of those
+rows would need a **fabricated** fiscal period. Tripling a topic with empty rows
+carrying invented periods, to make a key line up, is worse than the wrong doc.
+
+**So the fix is Dor's own fallback: make the contract describe reality.** Changed
+`schemas/README.md`, `schemas/sec.text.v1.schema.json` (two field descriptions),
+and `README.md` to state plainly that these topics do not join on `accession_no`,
+and to document `cik` + a `filed_date` window as the real method with honest
+coverage:
+
+| window | earnings-like releases | all text documents |
+|---|---|---|
+| exact | 20% | 11% |
+| ±1 day | 54% | 30% |
+| ±3 days | 61% | 35% |
+
+Coverage never approaches 100% because most 8-Ks aren't tied to a periodic filing
+at all — a leadership change has no 10-Q to match. An unmatched press release is
+normal, not missing data. Worth noting the ±1-day cliff is caused by the thing
+that makes this data good: the earnings 8-K lands the day *before* the 10-Q, so
+it is dated to the day the stock reacts.
+
+**No wire format changed** — no field added, removed, or retyped, so no Spark
+`StructType` and no Elasticsearch mapping moves. This is prose correction, not a
+contract re-freeze. `scripts/validate_schemas.py` still passes on all 3 samples.
+
+**Left open as a real contract conversation:** the semantically correct join is
+by fiscal period — "the 8-K announcing Q3 results" ↔ "the 10-Q for Q3" — which
+needs a nullable period field on `sec.text.v1`. That *is* a freeze-breaking
+change, so it belongs to the team, not to this commit. Filed as ticket 0012.
+
+**Lesson worth keeping:** the contract was written from a single hand-checked
+example and stayed authoritative after the example went stale. Both wrong lines
+had been read and trusted by two people before anyone ran the count.

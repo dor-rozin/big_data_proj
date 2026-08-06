@@ -20,6 +20,7 @@ status changes.
 | [0009](0009-readme-and-demo-runbook.md) | README + demo runbook + cold-start check | todo | 0002–0004, 0007 |
 | [0010](0010-filing-text-producer.md) | Filing text — 8-K press releases → `sec.text.v1` | in-progress | 0001, 0003, 0006 |
 | [0011](0011-dagster-orchestration.md) | Dagster orchestration for the interval Spark run (stretch) | todo | 0007, 0009 |
+| [0012](0012-text-filings-period-join.md) | Join `sec.text.v1` ↔ `sec.filings.v1` by fiscal period (contract change) | todo | 0001, 0010 |
 
 **Legend:** `todo` → `in-progress` → `done` (mirror whatever value is in the
 ticket's own `status:` frontmatter field).
@@ -109,6 +110,10 @@ Per the suggested schedule in [README.md](README.md#order-of-work):
    cuttable if time is tight.
 6. **0011** (Dagster orchestration) is a backpocket stretch item — only pick it
    up once 0007 and 0009 are done and there's time left before the demo.
+7. **0012** (period join) is not urgent — the contract is now *correct* about
+   how the two SEC topics join, just not as precise as it could be. Needs Dor
+   and Person C in the room before it starts, since it moves `spark/schemas.py`
+   and an Elasticsearch mapping.
 
 ## How to keep this file honest
 

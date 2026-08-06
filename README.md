@@ -271,12 +271,14 @@ no price bar to join against would just be noise — so a normal run puts roughl
 100-120 `sec.text.v1` messages on the topic, not 1,300. The full archive stays
 on disk for anyone who wants a wider window later.
 
-**Known join gap:** `sec.filings.v1` is only populated from `10-K`/`10-Q`
-filings (`scripts/fetch_historical_filings.py`), not `8-K`, so a `sec.text.v1`
-message's `accession_no` will not be found on `sec.filings.v1` — the two topics
-join by `cik` + nearby `filed_date` instead, not `accession_no`. Extending the
-filings fetch to include `8-K` would close this gap but was left out of this
-pass to avoid changing the already-verified filings snapshot's scope.
+**Do not join `sec.text.v1` to `sec.filings.v1` on `accession_no`** — it matches
+exactly zero rows, and it fails silently rather than erroring. The two topics
+carry different documents (`8-K` press releases vs `10-K`/`10-Q`), so they never
+share an accession number. Join on `cik` plus a `filed_date` window: ~61% of
+earnings releases find a related filing within ±3 days, and press releases with
+no match at all are normal, because most 8-Ks are not tied to a periodic filing.
+Full numbers and the reasoning are in
+[`schemas/README.md`](schemas/README.md#do-not-join-these-two-topics-on-accession_no).
 
 **The Spark job reads all three topics against the frozen contract** and was
 previously verified against a hand-loaded sample message; it has not yet been

@@ -27,7 +27,7 @@
       "const": 1
     },
     "cik": {
-      "description": "SEC Central Index Key, zero-padded to exactly 10 digits. Joins to sec.filings.v1.",
+      "description": "SEC Central Index Key, zero-padded to exactly 10 digits. This is the join key to sec.filings.v1 - pair it with a filed_date window, since a press release and its related periodic filing land on different days.",
       "type": "string",
       "pattern": "^[0-9]{10}$"
     },
@@ -39,7 +39,7 @@
       "maxLength": 12
     },
     "accession_no": {
-      "description": "Accession number of the filing this text came from, dashed form. Joins to sec.filings.v1.",
+      "description": "Accession number of the 8-K this text came from, dashed form. Identifies the parent filing; NOT a join key to sec.filings.v1, which carries 10-K/10-Q accessions only and never shares one with this topic. Join on cik plus a filed_date window instead - see schemas/README.md.",
       "type": "string",
       "pattern": "^[0-9]{10}-[0-9]{2}-[0-9]{6}$"
     },
