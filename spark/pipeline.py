@@ -38,7 +38,20 @@ import llm
 
 # ---- config ---------------------------------------------------------------
 def _env(name, default):
-    return os.getenv(name, default)
+    """Read an env var, treating an empty value as unset.
+
+    `.env.example` ships several variables with no value on purpose — they mean
+    "use the built-in default" (`PROMPT_PATH=`, `REPLAY_SPEED=`,
+    `LLM_MIN_INTERVAL_SECONDS=`). But `env_file` passes those through as empty
+    strings, not as absent, so `os.getenv(name, default)` returns `""` and the
+    default never applies. `PROMPT_PATH=""` then reaches `open("")` and the job
+    dies with `FileNotFoundError: ''` — for anyone who copied the template.
+
+    `_int` and `_float` already coerce empty to their default; this makes `_env`
+    agree with them.
+    """
+    value = os.getenv(name)
+    return default if value is None or value == "" else value
 
 
 def _int(name, default):

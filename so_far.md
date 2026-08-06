@@ -42,6 +42,7 @@ add tests for an area; if an area has no row, there is nothing to run for it.
 | `spark/` — analyst context capture | `docker compose --profile jobs run --rm -e LLM_ENABLED=false spark` then `curl -s localhost:9200/stock_context/_count` — must be 10, and `ls llm_output/_prompts/` must hold 10 files. Costs no API quota; this is the check to run while iterating on the prompt. |
 | Full stack — clean end-to-end run | Follow [RUNBOOK.md](RUNBOOK.md) top to bottom. It states the expected output for every step, so a mismatch anywhere is the failure point. Ends with an idempotency check. |
 | `spark/` — provider chain | `docker compose --profile jobs run --rm spark`. The banner shows the chain (`groq -> gemini`), and the closing `produced by:` line names which model wrote each analysis. Every row in `stock_analysis` must carry `provider_used`. |
+| `spark/` — runs without a key | `docker compose --profile jobs run --rm -e GROQ_API_KEY= -e GEMINI_API_KEY= spark` — must exit 0, skip stage 4 with a clear message, and still write `stock_prices`, `stock_filings` and `stock_context`. This is the path every new teammate hits first. |
 | `spark/` — fallback triggers | Force a retirement and confirm the run still finishes: `-e GROQ_API_KEY=bad` (auth → retire on row 1, all rows via the fallback), or `-e LLM_FALLBACK_PROVIDERS=ollama` without starting the container (unreachable → retire, no fallback left, rows recorded as failures). Neither may hang. |
 | `spark/` — schema-drift guard | Rename a field in a `StructType` in `spark/schemas.py` (e.g. `ts` → `date`) and re-run. `assert_parsed` must fail naming the topic, rather than the job exiting 0 having produced nothing. |
 | everything else | No test framework is set up. No `tests/` directory and no test dependency in `producer/`, `spark/`, or `dashboard/` requirements. |
@@ -1014,3 +1015,43 @@ Keeping the LLM outside Spark is also the right call independently: ten HTTP
 calls belong on the driver where pacing and retries are controllable, not spread
 across executors where a failed task re-runs a partition and re-issues calls that
 already cost quota.
+
+### 2026-08-06 — API keys per person, and a crash on the path every teammate hits first (Dor)
+
+Asked what happens to the API key when someone else runs the project. `.env` is
+gitignored, so a key never leaves the machine it was created on and a fresh clone
+gets `.env.example` with the key fields empty. Each person needs their own —
+free, a minute to obtain, no card. Sharing one is not a secrecy problem here so
+much as a quota one: the budgets are per key, so three people rehearsing on one
+key exhaust it three times as fast.
+
+**Testing that path found a crash, and it had nothing to do with keys.**
+Simulating a teammate with no credentials produced
+`FileNotFoundError: [Errno 2] No such file or directory: ''` and exit 1.
+
+`.env.example` ships several variables deliberately empty, meaning "use the
+built-in default" — `PROMPT_PATH=`, `REPLAY_SPEED=`,
+`LLM_MIN_INTERVAL_SECONDS=`. But `env_file` passes an empty variable through as
+an empty *string*, not as absent, so `os.getenv(name, default)` returns `""` and
+the default never applies. `PROMPT_PATH` became `""` and reached `open("")`.
+
+This would have hit **every teammate on their first run, with or without a key**,
+because it comes straight from copying the template. It was introduced an hour
+earlier while syncing `.env` to `.env.example` — before that, the variable was
+simply absent locally and the default worked, so nothing showed it. `_int` and
+`_float` already coerced empty to their defaults; only `_env` did not. Now it
+agrees with them.
+
+**Verified after the fix, both cases exit 0:**
+
+- *No keys at all* — stage 4 skips with `no API key set for any provider in the
+  chain`, and `stock_prices` (2,500), `stock_filings` (875) and `stock_context`
+  (10) are all still written, prompts still dumped. Only `stock_analysis` is
+  absent.
+- *Groq key only, no Gemini* — 10/10 analyses via Groq, the keyless fallback
+  quietly skipped rather than stalling the run.
+
+**Worth noting how this was found.** It surfaced from asking what a *different
+person* would experience, not from testing the code as configured on this
+machine. A working `.env` had been masking a template that crashes on copy. Added
+as a test row above, since it is the first thing anyone new runs into.

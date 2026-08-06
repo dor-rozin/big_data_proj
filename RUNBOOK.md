@@ -17,6 +17,73 @@ Expected end state:
 
 ---
 
+# First time on this machine — do this before anything else
+
+Skip to step 0 if you have already done it once.
+
+## A · Create your `.env`
+
+```bash
+cd big_data_proj
+cp .env.example .env
+```
+
+**`.env` is gitignored and never comes down from git.** It is where API keys
+live, so each person creates their own. The copy fills in 37 values that are
+already correct — Kafka addresses, topic names, index names, snapshot paths — and
+you change none of them.
+
+## B · Get your own API key and paste it in
+
+The analyst stage calls a hosted LLM. Keys are **free**, take about a minute, and
+need no card. **Get your own — do not reuse a teammate's.** The free budgets are
+metered per key, so three people sharing one exhaust it three times as fast.
+
+| Provider | Where | Put it in `.env` as |
+|---|---|---|
+| **Groq** (primary, recommended) | https://console.groq.com/keys | `GROQ_API_KEY=gsk_...` |
+| **Gemini** (fallback, optional) | https://aistudio.google.com/apikey | `GEMINI_API_KEY=...` |
+
+Groq alone is enough. Adding Gemini gives the chain somewhere to fail over when
+Groq's daily budget runs out.
+
+Write the value bare — no quotes, no spaces around the `=`:
+
+```
+GROQ_API_KEY=gsk_abc123...
+```
+
+Check it took, without printing the whole thing:
+
+```bash
+export $(grep "^GROQ_API_KEY=" .env | xargs)
+curl -s -H "Authorization: Bearer $GROQ_API_KEY" \
+  https://api.groq.com/openai/v1/models | grep -c '"id"'
+```
+
+A number back (a dozen or so) means the key works. Nothing back means it does
+not — check for stray quotes or a truncated paste.
+
+### Leave the other blanks alone
+
+`.env.example` also ships `REPLAY_SPLIT_AT`, `REPLAY_SPEED`, `REPLAY_MODE`,
+`LLM_MIN_INTERVAL_SECONDS` and `PROMPT_PATH` with **no value on purpose** — empty
+means "use the built-in default". Don't fill them in unless you mean to override
+something.
+
+### No key? It still runs.
+
+Stage 4 skips itself and the run exits 0. You get `stock_prices`,
+`stock_filings` and `stock_context`, plus the prompts in `llm_output/_prompts/`.
+Only `stock_analysis` is missing.
+
+## C · Give Docker enough memory
+
+Docker Desktop → Settings → Resources → **at least 8 GB** (10-12 GB if you plan
+to enable the local `ollama` fallback).
+
+---
+
 ## 0 · Tear down
 
 ```bash
@@ -380,6 +447,13 @@ curl -s "localhost:9200/stock_context/_search?pretty" -H 'Content-Type: applicat
   -d '{"_source":["ticker","filing_text_available","anomalies_near_filing"],"size":20}'
 ```
 
-**Running without an API key.** Add `-e LLM_ENABLED=false` to the Spark command.
-Stages 1, 2, 2b, 3, 3b and 5 all run; `stock_analysis` is simply not written, and
-the prompts are still dumped so the context stays inspectable.
+**Running without an API key.** Nothing special is required — if no provider in
+the chain has a key, stage 4 skips itself and the run exits 0. Stages 1, 2, 2b, 3,
+3b and 5 all complete, and the prompts are still dumped so the context stays
+inspectable. `-e LLM_ENABLED=false` does the same thing explicitly.
+
+**Each person needs their own key.** `.env` is gitignored, so a fresh clone has
+`.env.example` with the key fields empty. Free keys:
+[Groq](https://console.groq.com/keys), [Gemini](https://aistudio.google.com/apikey).
+Don't share one across the team — the free budgets are per key, so three people
+rehearsing on one exhaust it three times as fast.
