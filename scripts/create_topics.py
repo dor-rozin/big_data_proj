@@ -48,7 +48,7 @@ TOPICS = {
     },
     os.getenv("TEXT_TOPIC", "sec.text.v1"): {
         "key": "cik",
-        "note": "SEC filing narrative text (no producer yet, ticket 0010)",
+        "note": "SEC filing narrative text (8-K press releases, ticket 0010)",
     },
 }
 
