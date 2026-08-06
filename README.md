@@ -67,11 +67,19 @@ line of config. See [The AI capability](#the-ai-capability-explained). Set
 
 ## How to run
 
+**First time on this machine:** `.env` is gitignored, so it does not come down
+from git — create it and add your own free API key **before** running anything.
+[RUNBOOK.md](RUNBOOK.md#first-time-on-this-machine--do-this-before-anything-else)
+walks through it; the short version is step 1 below.
+
 ```bash
-# 1. Create the local config, then add an LLM key to .env.
-#    Groq (recommended): https://console.groq.com/keys -> GROQ_API_KEY=...
-#    Gemini (alternative): https://aistudio.google.com/apikey -> GEMINI_API_KEY=...
-#    (Skip the key and set LLM_ENABLED=false to run everything but the analyst.)
+# 1. Create your local config, then paste in your own free API key.
+#    Groq (recommended):   https://console.groq.com/keys      -> GROQ_API_KEY=gsk_...
+#    Gemini (optional fallback): https://aistudio.google.com/apikey -> GEMINI_API_KEY=...
+#
+#    Get YOUR OWN key rather than reusing a teammate's — the free budgets are
+#    metered per key. No key at all is fine too: stage 4 skips itself and
+#    everything except stock_analysis is still produced.
 cp .env.example .env
 
 # 2. Start the stack. This brings up Kafka, Elasticsearch, kafka-ui and the
@@ -406,6 +414,30 @@ Two classes of failure, and the distinction is the design:
 available the client retries twice and hands the row over; when it is the last
 resort it retries five times. Grinding through five attempts against a provider
 that is already refusing produces the same outcome minutes later.
+
+#### Every person needs their own key
+
+`.env` is gitignored, so **your key never leaves your machine** — pulling this
+repo gives a teammate `.env.example`, where the key fields are empty. Each person
+gets their own free key; they take about a minute and there is no card involved.
+
+Don't share one between the team. It isn't a secrecy concern for a course
+project, it's a quota one: the free budgets are per key, and three people
+rehearsing against a shared key exhaust it three times as fast.
+
+**Running without a key is fully supported.** With no key configured for any
+provider in the chain, stage 4 is skipped and everything else runs: `stock_prices`,
+`stock_filings` and `stock_context` are all written, and the prompts are still
+dumped to `llm_output/_prompts/` so the analyst context stays inspectable. Only
+`stock_analysis` is absent.
+
+```
+Stage 4 - LLM analyst (groq -> gemini)
+[llm] no API key set for any provider in the chain - skipping.
+```
+
+A key for *some* providers works too — one without a key is skipped and the
+chain moves to the next.
 
 #### Provenance
 

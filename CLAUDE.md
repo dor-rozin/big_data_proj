@@ -11,6 +11,11 @@ See [README.md](README.md) for the architecture and design rationale,
 [RUNBOOK.md](RUNBOOK.md) to run it end to end with validation at every step, and
 [so_far.md](so_far.md) for who has done what.
 
+**First run on a machine needs `cp .env.example .env` plus a free API key** —
+`.env` is gitignored, so it never arrives from git. See the first-time section at
+the top of RUNBOOK.md. Without a key the pipeline still runs; only the analyst
+stage is skipped.
+
 | Folder      | Stage                                                        |
 |-------------|--------------------------------------------------------------|
 | `producer/` | Ingest: parquet snapshot replay → Kafka (backfill + live)     |
