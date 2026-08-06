@@ -1115,3 +1115,50 @@ messages end to end — `spark/` already has `TEXT_SCHEMA` wired in from the
 topic. `.claude/0010-filing-text-producer.md` marked `in-progress`, not `done`,
 for this reason and the file-layout deviation (`scripts/` + `produce.py`
 instead of a standalone `producers/text_producer.py`) — see `.claude/index.md`.
+
+### 2026-08-06 — Spark side reconciled with the real filing text (Dor)
+
+Pulled ticket 0010. `sec.text.v1` now carries real data and the Spark half
+consumed it with no code change — the text path had been built against the
+frozen contract and exercised against the sample, so the only work was
+confirming it and correcting the numbers everywhere they were written down.
+
+**Verified end to end on the new snapshot:** producer delivered 3,435/3,435
+(was 3,375); topics hold 2,500 / 875 / **60**; Spark parsed all three, flagged
+130 anomalies, and produced 10/10 analyses. **All ten instruments now report
+`filing_text_available: true`** — where nine of ten were false yesterday.
+
+**Consequence worth planning around: prompts nearly tripled**, ~4,300 to ~12,000
+characters, so a ten-instrument run costs roughly 35k tokens rather than 13k.
+Against Groq's 100,000/day that is **about three runs, down from seven**.
+`LLM_MAX_TEXT_CHARS` (6,000) is the lever if that becomes binding. The 50-ticker
+arithmetic sketched earlier gets correspondingly worse — one run would now
+exceed the daily budget outright, which is the case for adding `ollama` to the
+chain rather than a second hosted key.
+
+**Bug found and fixed — a transient SSL error retired a healthy provider.** A
+single `SSL: UNEXPECTED_EOF_WHILE_READING` mid-run was classified as
+"unreachable" and retired Groq for the whole run, sending everything after it to
+the slower fallback. Ordinary internet turbulence is not an unavailable
+provider. `URLError` is now split: `ConnectionRefusedError` and
+`socket.gaierror` (nothing listening, DNS failure — Ollama not started, a
+typo'd host) still retire the provider, because they will not resolve mid-run;
+everything else is treated as a per-row transient and retried.
+
+The immediately following run showed the classification doing its job for real:
+Groq served six instruments, hit its **daily token budget** on the seventh
+(a legitimate `ProviderUnavailable`, 107s requested), was retired, and Gemini
+completed the remaining four. `produced by: gemini x4, groq x6`, 10/10.
+
+**Runbook step 5 is now a no-op** and says so. It used to hand-load a sample
+message into `sec.text.v1`; the producer emits real text now, so there is
+nothing to run. Expected counts throughout the runbook updated: 3,435 delivered,
+60 text messages, and the note about nine of ten instruments lacking text is
+replaced with the fact that all ten now have it.
+
+**Still open from ticket 0010's own notes (Amir's, not mine):** `sec.filings.v1`
+only covers `10-K`/`10-Q`, while `sec.text.v1` comes from `8-K`, so a text
+message's `accession_no` will never match a filings row. The Spark aggregate is
+unaffected — it joins text to prices by `ticker` and date, never by
+`accession_no` — but `schemas/README.md` still advertises `accession_no` as the
+join key between those two topics, and that join would return nothing today.
