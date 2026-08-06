@@ -31,3 +31,6 @@ spark-ivy/
 .vscode/
 .idea/
 .DS_Store
+
+# Spark analyst notes - regenerated on every pipeline run
+llm_output/

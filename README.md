@@ -1,37 +1,50 @@
-# Big Data & AI — Stock Anomaly Detection + News Sentiment
+# Big Data & AI — Stock Anomaly Detection + LLM Analyst
 
 End-to-end big data pipeline for the course project.
 
-**Pipeline:** `snapshot files → Kafka → Spark (transform + MLlib anomaly detection) → Elasticsearch → Streamlit`
+**Pipeline:** `snapshot files → Kafka → Spark (transform + MLlib anomalies) → LLM analyst → Elasticsearch → Streamlit`
 
-- **Data (semi-structured + unstructured):** daily OHLCV price bars from yfinance *and* SEC filings from EDGAR, captured once into `historical_data/` and replayed into Kafka in two passes — a year of history bulk-loaded up front, then the following year streamed in slowly as simulated live traffic. Replaying a snapshot rather than fetching live means the demo works with no internet and produces identical bytes every run.
+- **Data (semi-structured + unstructured):** daily OHLCV price bars from yfinance *and* SEC filings from EDGAR — both the numeric facts and the narrative text — captured once into `historical_data/` and replayed into Kafka in two passes: a year of history bulk-loaded up front, then the following year streamed in slowly as simulated live traffic. Replaying a snapshot rather than fetching live means the demo works with no internet and produces identical bytes every run.
 - **Course technologies:** Docker, Apache Kafka (KRaft mode), Apache Spark, Elasticsearch, Streamlit.
-- **AI capability (Spark MLlib):** KMeans-based **anomaly detection** on engineered price features — days that sit far from every cluster centre are flagged as unusual. Filing text is additionally scored for **sentiment** (VADER).
-- **Insight:** which days each stock behaved abnormally, and whether the tone of what the company filed lines up with those days.
+- **AI capability — two stages that depend on each other:** Spark MLlib **KMeans** flags trading days that sit far from an instrument's own normal behaviour, and those flagged days are then handed to an **LLM** (Groq or Gemini, switchable), which writes an analyst note and a buy/hold/sell recommendation. The model finds *where to look*; the LLM says *what it means*.
+- **Insight:** which days each stock behaved abnormally, how those days line up with its filings, and what a careful reader would conclude from the two together.
 
-Everything runs locally in Docker and is **free** — no paid APIs, no keys.
+The infrastructure runs entirely locally in Docker. The analyst stage calls a
+hosted LLM, which needs a **free API key** — Groq or Gemini, switched with one
+line of config. See [The AI capability](#the-ai-capability-explained). Set
+`LLM_ENABLED=false` to run everything else without a key at all.
 
 ## Architecture
 
 ```
                  ┌─────────────┐ market.prices.v1 ┌──────────────────────┐
- historical_data/│  producer   │ ───────────────▶ │        Kafka         │
- (parquet)  ───▶ │  (replay)   │  sec.filings.v1  │   (KRaft, 1 node)    │
-                 └─────────────┘ ───────────────▶ └──────────┬───────────┘
+ historical_data/│  producer   │  sec.filings.v1  │        Kafka         │
+ (parquet)  ───▶ │  (replay)   │ ───────────────▶ │   (KRaft, 1 node)    │
+                 └─────────────┘    sec.text.v1   └──────────┬───────────┘
                                                              │  batch read
                                                              ▼
                                                   ┌──────────────────────┐
                                                   │        Spark         │
-                                                  │  features + KMeans    │
-                                                  │  anomaly detection    │
-                                                  │  + VADER sentiment    │
+                                                  │  1. tabular transform │
+                                                  │  2. MLlib KMeans      │
+                                                  │     anomaly flags     │
+                                                  │  3. aggregate/ticker  │
                                                   └──────────┬───────────┘
-                                                             │  bulk load
+                                                             │  10 rows
+                                                             ▼
+                                                  ┌──────────────────────┐
+                                                  │  LLM (Groq / Gemini) │
+                                                  │  analyst note + JSON  │
+                                                  │  recommendation       │
+                                                  └──────────┬───────────┘
+                                                             │  bulk upsert
                                                              ▼
                                                   ┌──────────────────────┐
                                                   │    Elasticsearch     │
-                                                  │  stock_prices /       │
-                                                  │  stock_news indices   │
+                                                  │  stock_prices        │
+                                                  │  stock_filings       │
+                                                  │  stock_context       │
+                                                  │  stock_analysis      │
                                                   └──────────┬───────────┘
                                                              │  query
                                                              ▼
@@ -47,10 +60,18 @@ Everything runs locally in Docker and is **free** — no paid APIs, no keys.
 - **Docker Desktop** (Mac/Windows) or Docker Engine + Compose plugin (Linux).
 - Give Docker ~8 GB RAM (Settings → Resources).
 
+> **Running it for the first time, or demoing it?** Use
+> **[RUNBOOK.md](RUNBOOK.md)** instead of the quick-start below. It is the same
+> sequence starting from a clean teardown, with the expected output and a
+> validation command after every step.
+
 ## How to run
 
 ```bash
-# 1. Create the local config. Defaults work as-is.
+# 1. Create the local config, then add an LLM key to .env.
+#    Groq (recommended): https://console.groq.com/keys -> GROQ_API_KEY=...
+#    Gemini (alternative): https://aistudio.google.com/apikey -> GEMINI_API_KEY=...
+#    (Skip the key and set LLM_ENABLED=false to run everything but the analyst.)
 cp .env.example .env
 
 # 2. Start the stack. This brings up Kafka, Elasticsearch, kafka-ui and the
@@ -65,11 +86,14 @@ docker compose run --rm producer
 docker compose --profile live up -d producer-live
 docker compose logs -f producer-live
 
-# 5. Run the Spark pipeline: transform + anomaly detection + load into Elasticsearch.
-#    (First run downloads the Kafka connector jar — needs internet, ~1 min.)
-docker compose run --rm spark
+# 5. Run the Spark pipeline: transform + anomaly detection + LLM analyst +
+#    load into Elasticsearch. ~1 min on Groq. (First run also downloads the
+#    Kafka connector jar.)
+docker compose --profile jobs run --rm spark
 
 # 6. Open the dashboard at http://localhost:8501
+#    Analyst notes are written to ./llm_output/, and the exact prompts that
+#    were sent to ./llm_output/_prompts/
 
 # When finished:
 docker compose down          # stop, keep data
@@ -168,16 +192,26 @@ tags and the security tradeoffs behind this stack are recorded in
 
 ## Repository layout & team split
 
-| Folder        | Stage                              | Owner     |
-|---------------|------------------------------------|-----------|
-| `producer/`   | Ingest: snapshot replay → Kafka    | Person A  |
-| `spark/`      | Transform + MLlib anomaly detection| Person B  |
-| `spark/` (ES load) + `dashboard/` | Load + results/dashboard | Person C |
-| `schemas/`    | Frozen Kafka message contract      | Person A  |
-| `scripts/`    | Operational helper scripts         | Person A  |
+| Folder        | Stage                                          | Owner     |
+|---------------|------------------------------------------------|-----------|
+| `producer/`   | Ingest: snapshot replay → Kafka                | Person A  |
+| `schemas/`    | Frozen Kafka message contract                  | Person A  |
+| `scripts/`    | Operational helper scripts                     | Person A  |
+| `spark/`      | Transform + MLlib anomalies + LLM analyst + ES load | Dor  |
+| `dashboard/`  | Streamlit dashboard over the four indices      | Person C  |
 
-Each stage passes data by a defined schema (see `pipeline.py`), so the three
-parts can be built and tested independently.
+Each stage passes data by a defined schema, so the three parts can be built and
+tested independently. The Spark half is split across small modules:
+
+| File | Responsibility |
+|---|---|
+| `spark/schemas.py` | The three contract `StructType`s + the parse guard |
+| `spark/transforms.py` | Kafka JSON → analysis-ready tables, and the per-ticker aggregate |
+| `spark/anomaly.py` | MLlib KMeans anomaly detection |
+| `spark/llm.py` | Gemini REST client: pacing, retries, response parsing |
+| `spark/es_writer.py` | Streamed, batched, idempotent Elasticsearch load |
+| `spark/prompts/analyst.md` | The analyst prompt — edit this, not the code |
+| `spark/pipeline.py` | Orchestrates the five stages |
 
 The Kafka message contract for the reworked producer stage — field tables,
 nullability, and the UTC/uppercase-ticker/zero-padded-CIK rules — is frozen in
@@ -215,10 +249,21 @@ filings replaced news headlines. The text is the `EX-99.1` exhibit of an earning
 stock actually reacts, and joins to a price anomaly by date.
 
 `market.prices.v1` and `sec.filings.v1` are wired into the run steps above:
-`topic-init` creates them and the producer writes to them. `sec.text.v1` is
-created but has no producer yet — that is ticket 0010. The Spark job's news
-branch still reads the old `news` topic and needs migrating to `sec.text.v1`
-before step 4 works end to end; see [`.claude/index.md`](.claude/index.md).
+`topic-init` creates them and the producer writes to them.
+
+**The Spark job reads all three topics against the frozen contract.**
+`sec.text.v1` is created but has no producer yet (ticket 0010), so the analyst
+stage currently runs on price and filing data alone and says so — the generated
+notes flag the missing narrative text as a stated limitation and lower their own
+confidence accordingly. Nothing needs changing on the Spark side when that
+producer lands; the text path is already built. To exercise it in the meantime,
+load the sample message by hand:
+
+```bash
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic sec.text.v1 \
+  < schemas/samples/sec.text.v1.json
+```
 
 ## Configuration (`.env`)
 
@@ -240,28 +285,209 @@ the ones you are most likely to change:
 | `REPLAY_DURATION`      | Wall-clock seconds the live stream is spread over (300)                |
 | `REPLAY_LIMIT`         | Cap on messages produced (`0` = no cap)                                |
 | `SNAPSHOT_DIR`         | Where the producer container finds the parquet files (`/snapshots`)    |
-| `ANOMALY_FRACTION`     | Fraction of days flagged as anomalies (e.g. `0.05`)                    |
+| `KMEANS_K`             | Clusters in the anomaly model (3)                                      |
+| `ANOMALY_FRACTION`     | Fraction of bars flagged as anomalies, **per group** (`0.05`)          |
+| `MIN_ROWS_PER_GROUP`   | Groups smaller than this are passed through unflagged (30)             |
+| `LLM_PROVIDER`         | `groq` or `gemini`. Only the transport differs — everything else is shared |
+| `GROQ_API_KEY`         | Free key from [Groq Console](https://console.groq.com/keys). `.env` only |
+| `GROQ_MODEL`           | Model id (`llama-3.3-70b-versatile`)                                   |
+| `GEMINI_API_KEY`       | Free key from [AI Studio](https://aistudio.google.com/apikey). `.env` only |
+| `GEMINI_MODEL`         | Model id (`gemini-3.6-flash`)                                          |
+| `LLM_ENABLED`          | `false` skips the analyst stage entirely — no key needed               |
+| `LLM_MIN_INTERVAL_SECONDS` | Seconds between API calls. Empty = per-provider default (1s groq, 13s gemini) |
+| `LLM_MAX_CALLS`        | Hard ceiling on API calls per run (50). Truncation is logged, never silent |
+| `ANALYSIS_INDEX`       | Elasticsearch index for the LLM output (`stock_analysis`)              |
+| `CONTEXT_INDEX`        | Index holding what the analyst was shown (`stock_context`)             |
 
 ## The AI capability, explained
 
-We use **Spark MLlib KMeans** as an unsupervised anomaly detector:
+Two stages, and the second depends on the first.
 
-1. Per ticker we engineer four features: daily return, volume change, intraday
-   range %, and 10-day rolling volatility.
-2. Features are standardised (`StandardScaler`) so no single one dominates.
-3. KMeans (k=3) learns clusters of "normal" trading behaviour.
-4. For each day we compute the Euclidean distance to its assigned cluster
-   centre. Days in the top `ANOMALY_FRACTION` by distance are flagged as
-   anomalies — they don't fit any normal regime.
+### 1. Spark MLlib KMeans — finding *where to look*
 
-This is fully explainable (every step is a known transformation) and free.
+1. Four features per bar: daily return, volume change, intraday range %, and
+   10-day rolling volatility.
+2. Features are z-scored **within each `(ticker, interval)` group**. This is what
+   makes the result meaningful — on a global scale NVDA's volatility would
+   define "normal" for the whole universe and JPM would never look unusual.
+3. One KMeans (`k=3`) is fitted across every group at once. Fitting one model per
+   ticker would be N Spark jobs and stops scaling; one fit over pre-scaled
+   features is a single distributed job whatever the universe size.
+4. Each bar's Euclidean distance to its assigned cluster centre becomes its
+   `anomaly_score`. The top `ANOMALY_FRACTION` **within each group** are flagged,
+   so every instrument contributes its own share rather than the volatile names
+   crowding out the rest.
+
+Every step is a known transformation, so any flag can be traced back to the
+numbers that produced it.
+
+### 2. The LLM — saying *what it means*
+
+The pipeline then collapses everything to one row per `(ticker, interval)`:
+price summary, the top-5 anomalies with their dates and returns, how many
+anomalies landed within two days of a filing, the latest reported financials, and
+filing text where available. That row goes to the LLM with the prompt in
+[`spark/prompts/analyst.md`](spark/prompts/analyst.md), which returns a JSON
+recommendation (`buy`/`hold`/`sell`, confidence, risks, signals) plus a prose note.
+
+**Why the two stages need each other.** An LLM cannot scan thousands of price
+bars or do reliable arithmetic over them, so without stage 1 the prompt would
+carry a coarse average and produce a note that would read the same for any
+company. KMeans does the scanning cheaply and deterministically, so the prompt
+names *specific unusual days with specific numbers*. That is the difference
+between a summariser and an analyst.
+
+**Aggregating first is what makes it affordable.** Ten instruments means ten API
+calls, not one per row.
+
+### Seeing what the analyst was given
+
+The aggregate is not thrown away after the call. Stage 3b persists it two ways,
+**before** the API is involved and whether or not the API is called at all:
+
+| Where | What |
+|---|---|
+| `stock_context` index | The aggregate as queryable fields, plus `context_json` — the literal blob embedded in the prompt |
+| `llm_output/_prompts/TICKER.txt` | The exact prompt string, assembled by the same code path that sends it |
+
+Both cost no API quota, which is the point: iterate on
+[`spark/prompts/analyst.md`](spark/prompts/analyst.md) with `LLM_ENABLED=false`,
+inspect the assembled prompts, and spend the daily quota only on a prompt you
+have already checked.
+
+```bash
+# What the analyst saw for one ticker
+curl -s "localhost:9200/stock_context/_search?pretty" -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"ticker":"NVDA"}},"_source":{"excludes":["context_json"]}}'
+
+# Which instruments had anomalies clustering near a filing date
+curl -s "localhost:9200/stock_context/_search?pretty" -H 'Content-Type: application/json' \
+  -d '{"_source":["ticker","anomaly_count","anomalies_near_filing"],
+       "sort":[{"anomalies_near_filing":"desc"}]}'
+```
+
+### The provider chain
+
+`LLM_PROVIDER` sets the primary and `LLM_FALLBACK_PROVIDERS` an ordered chain
+after it. Only the transport differs between providers — the prompt, the context,
+the JSON contract, the pacing and the retries are shared.
+
+```
+LLM_PROVIDER=groq
+LLM_FALLBACK_PROVIDERS=gemini          # or: gemini,ollama
+```
+
+| | Groq | Gemini | Ollama (local) |
+|---|---|---|---|
+| Default model | `llama-3.3-70b-versatile` | `gemini-3.6-flash` | `llama3.2:3b` |
+| Pacing / timeout | 1s / 90s | 13s / 90s | 0s / 600s |
+| Limit | 100,000 tokens/day | ~5 req/min, ~30/day | none |
+
+#### What makes it move to the next provider
+
+Two classes of failure, and the distinction is the design:
+
+**Provider retired for the whole run** — every remaining instrument skips it:
+
+- **Budget exhausted** — a 429 asking for longer than `MAX_BACKOFF` (60s).
+  Observed in practice as *"asked for a 1362s wait"*.
+- **Auth rejected** — 401/403. A bad key fails identically for every row.
+- **Unreachable** — connection refused or DNS failure. Ollama not started.
+- **Two consecutive row failures** — not every exhausted provider announces
+  itself with one long wait. Gemini's per-minute limit returns 25-46s delays,
+  each under the ceiling, so without this rule every row retries and fails and
+  the provider is never retired.
+
+**Row-level — the provider stays in play**, only this instrument moves on:
+
+- Malformed JSON from the model, a one-off 5xx, a timeout.
+
+**Retries are for when there is nowhere else to go.** With a fallback still
+available the client retries twice and hands the row over; when it is the last
+resort it retries five times. Grinding through five attempts against a provider
+that is already refusing produces the same outcome minutes later.
+
+#### Provenance
+
+Every analysis records `provider_used` and `model_used`, in Elasticsearch and at
+the top of each `.txt` report. A note written by a 3B local model and one written
+by a 70B hosted model are not interchangeable, and the output should never leave
+that ambiguous. Each run also prints a summary — `produced by: groq x9, gemini x1`.
+
+#### The local fallback
+
+`ollama` runs as a container, needs no key and has no quota, so the analyst stage
+survives an exhausted budget or a dead network:
+
+```bash
+docker compose --profile local-llm up -d ollama
+docker compose --profile local-llm exec ollama ollama pull llama3.2:3b
+# then set LLM_FALLBACK_PROVIDERS=gemini,ollama
+```
+
+It is deliberately **not** the default. Docker on macOS cannot pass through the
+GPU, so inference is CPU-bound at roughly 30-60s per instrument against Groq's
+sub-second. It also needs ~4 GB of RAM on top of the rest of the stack — raise
+Docker Desktop to 10-12 GB before enabling it. Insurance, not the everyday path.
+
+### Choosing a provider to develop against
+
+| | Groq | Gemini |
+|---|---|---|
+| Default model | `llama-3.3-70b-versatile` | `gemini-3.6-flash` |
+| Free tier | **100,000 tokens/day** (~7 ten-instrument runs) | ~5 req/min **and** ~30 calls/day |
+| Ten-instrument run | **~1 min** | ~2.5 min, and often quota-blocked |
+| Default pacing | 1s | 13s |
+
+**Groq is the one to develop against**, but both have a daily budget and both
+will refuse you eventually. Groq meters **tokens**, not requests: 100,000/day
+against ~13k per ten-instrument run, so about seven runs. Gemini allows roughly
+two. Either way, iterate with `LLM_ENABLED=false` — the prompts are still
+dumped, so the context stays inspectable — and spend the budget on runs that
+matter.
+
+When a daily budget is exhausted the provider asks for a wait measured in
+minutes. The client refuses anything over 60 seconds and records those
+instruments as failures instead, so the run finishes in its normal time with
+partial results rather than stalling. Without that ceiling a single 606-second
+`retry-after` will hang the job with no output at all.
+
+Avoid Groq's `groq/compound*` models: they are agentic and can fetch external
+data, which breaks the prompt's first rule that only the supplied data may be
+used.
+
+A run that hits a rate limit fails only the affected instruments. Their `.txt`
+reports are removed rather than left stale, and no empty document is written
+over a good earlier analysis.
+
+### Keeping `recommendation` meaningful
+
+The prompt separates two things models tend to conflate: `recommendation` is the
+direction the evidence leans, and `confidence` is how much that direction can be
+trusted. Without that rule stated explicitly, a model asked to analyse thin data
+answers `"hold"` for everything — technically defensible, and useless as a field
+you want to filter or chart on.
+
+Making the separation explicit changed the output from 10/10 `hold` to a
+7/2/1 buy-hold-sell spread on identical data, with the remaining `hold`s landing
+on the two instruments whose signals genuinely conflict. `confidence` then does
+the hedging: `low` wherever filing text is missing or facts are sparse.
+
+**Honest limits.** A `k=3` KMeans over a few hundred bars finds large moves on
+heavy volume; it is a feature extractor, not a market model. The generated notes
+are a descriptive read of this dataset for a university project — not financial
+advice — and the prompt requires the model to treat missing facts as unknown
+rather than zero, and to lower its stated confidence when the data is thin.
 
 ## Data source & credit
 
 Price data from Yahoo Finance via the open-source
-[`yfinance`](https://github.com/ranaroussi/yfinance) library. Filing data from
-the U.S. SEC's public [EDGAR](https://www.sec.gov/edgar) XBRL company-facts API.
-Both were captured once into `historical_data/` by
+[`yfinance`](https://github.com/ranaroussi/yfinance) library. Filing data and
+text from the U.S. SEC's public [EDGAR](https://www.sec.gov/edgar) XBRL
+company-facts API. Both were captured once into `historical_data/` by
 `scripts/fetch_historical_data.py` and `scripts/fetch_historical_filings.py`;
 the pipeline replays those files rather than calling either source at run time.
-For educational use only.
+
+Analyst notes are generated by Google's
+[Gemini API](https://ai.google.dev/) free tier. For educational use only — the
+recommendations are model output over a course dataset, not investment advice.
