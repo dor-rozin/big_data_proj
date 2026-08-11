@@ -317,10 +317,14 @@ the ones you are most likely to change:
 | `LLM_MAX_CALLS`        | Hard ceiling on API calls per run (50). Truncation is logged, never silent |
 | `ANALYSIS_INDEX`       | Elasticsearch index for the LLM output (`stock_analysis`)              |
 | `CONTEXT_INDEX`        | Index holding what the analyst was shown (`stock_context`)             |
+| `DASHBOARD_YEARS`      | Fiscal years the seven charts start on (5). The sidebar slider overrides it per session |
+| `DASHBOARD_PROMPT_PATH` | Prompt for the **dashboard's** analyst. Empty = `dashboard/prompts/analyst_fundamentals.md` |
 
 ## The AI capability, explained
 
-Two stages, and the second depends on the first.
+Two stages inside the pipeline, where the second depends on the first — plus a
+**third, independent analyst in the dashboard** that answers the same question
+from different evidence. See [Two analysts, on purpose](#two-analysts-on-purpose).
 
 ### 1. Spark MLlib KMeans — finding *where to look*
 
@@ -383,6 +387,56 @@ curl -s "localhost:9200/stock_context/_search?pretty" -H 'Content-Type: applicat
 curl -s "localhost:9200/stock_context/_search?pretty" -H 'Content-Type: application/json' \
   -d '{"_source":["ticker","anomaly_count","anomalies_near_filing"],
        "sort":[{"anomalies_near_filing":"desc"}]}'
+```
+
+### Two analysts, on purpose
+
+The dashboard has its own analyst, and it is **not** a second view of the Spark
+note. Both answer "buy, hold or sell?" and both return the identical JSON
+contract, but they are grounded on different evidence and are allowed to
+disagree — a disagreement is a finding, not a bug.
+
+| | Spark's analyst | The dashboard's analyst |
+|---|---|---|
+| Code | `spark/llm.py`, stage 4 | `dashboard/ai_analyst.py` |
+| Prompt | `spark/prompts/analyst.md` | `dashboard/prompts/analyst_fundamentals.md` |
+| Grounded on | Price behaviour + the days KMeans flagged as unusual | The seven fundamentals metrics computed in `dashboard/kpis.py` |
+| Runs | In batch, once per pipeline run, for every instrument | Interactively, one company at a time, when a button is clicked |
+| Output | `stock_analysis` index + `llm_output/TICKER.md` | Rendered in the page; nothing is written back |
+
+Both read `LLM_PROVIDER`, the matching key and `LLM_ENABLED`, so one switch moves
+or disables both. The dashboard's ignores `LLM_FALLBACK_PROVIDERS`: it makes a
+single call for a single company, so there is no mid-run point at which failing
+over would help.
+
+**The click is deliberate.** Streamlit re-runs the whole script on every widget
+change, so an automatic call would fire a request each time the year slider moved
+and drain a free tier of ~30 calls/day in minutes. The answer is cached against
+the exact prompt, so re-reading it and interacting with the rest of the page cost
+nothing.
+
+**The reader can steer the emphasis, not the rules.** A single optional text field
+is appended to the prompt as an emphasis note — "focus on leverage", "explain it
+for a non-specialist", "weigh the share count trend most heavily". It arrives in
+its own section, after the data, under a frame telling the model it governs
+**wording and emphasis only**: it cannot change the seven metrics, the rules for
+reading them, the JSON contract, or add information the model was not given.
+
+That boundary is not caution for its own sake. The rules it sits beneath are what
+stop a model reading `shares_reported` and announcing a stock split as a 900%
+share issue, or reading a missing fact as a zero. An instruction able to displace
+them would not produce a worse answer — it would produce a confidently wrong one.
+A full prompt swap is still possible deliberately, via `DASHBOARD_PROMPT_PATH`.
+
+**The prompt is always inspectable, key or no key** — the same principle as stage
+3b above. Check the evidence and the assembled prompt without a browser, a
+network call or any of the pipeline running:
+
+```bash
+python dashboard/verify_ai.py              # all 10 tickers: prompt size, gaps
+python dashboard/verify_ai.py AAPL         # print the whole prompt
+python dashboard/verify_ai.py AAPL --call  # ...and spend exactly one API call
+python dashboard/verify_ai.py --focus "focus on leverage"   # with an emphasis note
 ```
 
 ### The provider chain

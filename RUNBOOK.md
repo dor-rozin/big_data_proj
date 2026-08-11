@@ -130,6 +130,27 @@ bash scripts/verify_stack.sh
 Expect **8 PASS lines**: `.env`, Elasticsearch, kafka-ui, Kafka from the host,
 Kafka in-network, and each of the three topics.
 
+### On Windows, run it like this or five checks lie to you
+
+In Git Bash, MSYS rewrites Unix-looking arguments into Windows paths, so the
+script's `docker compose exec -T kafka /opt/kafka/bin/...` calls arrive inside the
+container mangled and cannot run. You get **3 PASS and 5 FAIL on a perfectly
+healthy stack**, and because `check()` runs `eval "$cmd" >/dev/null 2>&1` the real
+error is hidden — it reads exactly like a dead broker. Also, a per-user Docker
+Desktop install leaves `docker` off `PATH`:
+
+```bash
+# cygpath is required: $LOCALAPPDATA holds a backslash path (C:\Users\...),
+# which bash cannot use in PATH as-is.
+export PATH="$(cygpath -u "$LOCALAPPDATA")/Programs/DockerDesktop/resources/bin:$PATH"
+export MSYS_NO_PATHCONV=1
+bash scripts/verify_stack.sh
+```
+
+Before believing any FAIL from this script on Windows, confirm independently:
+`docker compose ps` (kafka and elasticsearch should read `(healthy)`) and
+`docker compose logs topic-init` (three `CREATED` lines).
+
 **See how the topics were provisioned:**
 
 ```bash
