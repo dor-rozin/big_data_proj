@@ -299,6 +299,11 @@ services:
     env_file: .env
     ports:
       - "8501:8501"
+    volumes:
+      # Bind-mounted so Streamlit's auto-reload picks up an edit to the charts
+      # without a `docker compose build`. The image still COPYs the same code in,
+      # so the container remains self-contained if this mount is removed.
+      - ./dashboard:/app
 
 networks:
   # One explicit user-defined bridge, so service names resolve predictably and

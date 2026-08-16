@@ -13,7 +13,8 @@ To actually run the thing end to end with validation at every step, use
 | `producer/` — snapshot replay → Kafka | Amir | Runs end-to-end | Backfill + live modes both verified against a live broker: exact delivery counts, correct partitioning, headers intact. Now merges three sources (prices, filings, press-release text). Automated tests / `producers/` layout from ticket 0007 still outstanding |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
 | `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
-| `dashboard/` — Streamlit | Person C | Not started | Reads `stock_prices` / `stock_filings` / `stock_context` / `stock_analysis`. Note `stock_news` no longer exists |
+| `dashboard/` — Streamlit | Vilan | Code written, not verified | Rewritten 2026-08-11 into 5 modules (`kpis` / `es_client` / `charts` / `app` / `verify_kpis`) for 7 fundamentals charts. KPI arithmetic verified offline against the parquet snapshot. Docker on this machine is **no longer blocked** (WSL 2.7.11 installed 2026-08-11, stack verified 8 PASS) and the `dashboard` container now runs, but no producer/Spark run has happened yet, so `es_client.py` and `app.py` are still **unverified against populated indices** — see the second 2026-08-11 log entry |
+| AI capability — dashboard-side analyst | Vilan | Code written, not verified | Built 2026-08-11: `dashboard/ai_analyst.py` + `prompts/analyst_fundamentals.md`, rendered by an AI panel in `app.py`. BUY/HOLD/SELL grounded on the 7 computed KPIs, separate from Spark's `stock_analysis`. Evidence and prompt verified offline for all 10 tickers, and one live Gemini call passed the contract — but **the panel has never rendered in a browser**, because that needs populated indices and no Spark run has happened on this machine yet |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
 | `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Joins `sec.filings.v1` by `cik` + `filed_date` window, **never** `accession_no` (0 shared accessions — contract corrected 2026-08-06, see log) |
 | Infra — Docker Compose (ticket 0002) | Amir | Done | Verified live 2026-08-04: all acceptance criteria pass. Two real bugs found and fixed — see log |
@@ -46,6 +47,10 @@ add tests for an area; if an area has no row, there is nothing to run for it.
 | `spark/` — runs without a key | `docker compose --profile jobs run --rm -e GROQ_API_KEY= -e GEMINI_API_KEY= spark` — must exit 0, skip stage 4 with a clear message, and still write `stock_prices`, `stock_filings` and `stock_context`. This is the path every new teammate hits first. |
 | `spark/` — fallback triggers | Force a retirement and confirm the run still finishes: `-e GROQ_API_KEY=bad` (auth → retire on row 1, all rows via the fallback), or `-e LLM_FALLBACK_PROVIDERS=ollama` without starting the container (unreachable → retire, no fallback left, rows recorded as failures). Neither may hang. |
 | `spark/` — schema-drift guard | Rename a field in a `StructType` in `spark/schemas.py` (e.g. `ts` → `date`) and re-run. `assert_parsed` must fail naming the topic, rather than the job exiting 0 having produced nothing. |
+| `dashboard/` — KPI arithmetic, offline | `python dashboard/verify_kpis.py` — rebuilds the `stock_filings` document shape straight from `historical_data/` and runs every KPI. Needs no Docker, no broker, no Elasticsearch. Expect `7/7 charts` for 8 tickers, `6/7` for AMZN (no `liabilities`) and `5/7` for BRK.B (no EPS). Add a ticker to print every number: `python dashboard/verify_kpis.py AAPL`. |
+| `dashboard/` — figures build | `python -c "import sys;sys.path.insert(0,'dashboard');import verify_kpis as V,kpis,charts;f,p=V.load_filings(),V.load_prices();print(sum(1 for t in f.ticker.dropna().unique() for s,b in charts.CHART_BUILDERS.items() if b(kpis.compute_all(f[f.ticker==t],p[p.ticker==t])[s]))," figures")"` — must print 70. Catches plotly API drift between the container's 5.22 and a newer local version. |
+| `dashboard/` — AI analyst evidence + prompt, offline | `python dashboard/verify_ai.py` — builds the evidence object and the exact prompt for all 10 tickers from `historical_data/`. **No network, no quota, no Docker.** Expect `7/7 metrics with data` for eight tickers, `6/7` for AMZN, `5/7` for BRK.B — the same split `verify_kpis.py` reports, which is the point: if these two disagree, one of them has a bug. Add a ticker to print the whole prompt: `python dashboard/verify_ai.py AAPL`. |
+| `dashboard/` — AI analyst live contract | `python dashboard/verify_ai.py --call` — makes **exactly one** API call and validates the response against `REQUIRED_KEYS` / `VALID_RECOMMENDATION` / `VALID_CONFIDENCE`. Costs 1 of Gemini's ~30 daily calls. Expect a `contract OK:` line naming the recommendation, confidence, and the counts of signals and risks. With no key it prints why and exits 0 rather than failing. |
 | everything else | No test framework is set up. No `tests/` directory and no test dependency in `producer/`, `spark/`, or `dashboard/` requirements. |
 
 ## Log
@@ -1225,3 +1230,392 @@ change, so it belongs to the team, not to this commit. Filed as ticket 0012.
 **Lesson worth keeping:** the contract was written from a single hand-checked
 example and stayed authoritative after the example went stale. Both wrong lines
 had been read and trusted by two people before anyone ran the count.
+
+### 2026-08-11 — Dashboard rebuilt on the real indices; blocked on Docker (Vilan)
+
+`dashboard/app.py` had been dead since the 2026-08-05 Spark rebuild: it read a
+`stock_news` index and a `date` column that no longer exist. Rewritten from
+scratch as **seven fundamentals charts per company over five fiscal years**,
+plus the groundwork for a dashboard-side AI recommendation (stage 3, not started).
+
+**Split into four modules so the numbers can be checked without a stack.**
+Standing this pipeline up takes Docker, Kafka, a producer run and a Spark run
+before a single chart can be looked at, which is a slow loop for verifying
+whether a ratio is the right way up.
+
+| file | owns |
+|---|---|
+| `dashboard/kpis.py` | all arithmetic — pure pandas, no ES, no plotting |
+| `dashboard/es_client.py` | all Elasticsearch reads. **Read-only**; the Spark job stays the only writer |
+| `dashboard/charts.py` | all plotting — takes a computed KPI, returns a figure |
+| `dashboard/app.py` | Streamlit wiring and layout only |
+| `dashboard/verify_kpis.py` | offline harness: rebuilds the ES document shape from parquet and runs every KPI |
+
+**Three metric definitions were ambiguous and were decided, not guessed.**
+Field coverage was measured across the 61 annual filings since 2020 first, then
+the choice made against it:
+
+- **Buyback = `shares_outstanding`**, split-adjusted, rather than
+  `shares_diluted`. Diluted is a weighted average that also counts options and
+  convertibles — instruments that are not shares — so it answers a different
+  question. Accepted limits: META tags no `shares_outstanding` and BRK.B tags
+  neither share field, so both get an explicit gap rather than a substitute.
+- **Debt/equity = `liabilities / equity`**, deliberately *not* the pipeline's own
+  `debt_to_equity` (which is `long_term_debt / equity`). Total liabilities covers
+  9 of 10 companies rather than 8, and keeps JPM — the bank, whose leverage is
+  the most interesting one in the set — on the chart.
+- **Cash flow = operating cash flow** as the primary series (100% coverage), with
+  free cash flow beside it only where `capex` exists (~70%; AMZN, JPM and NVDA do
+  not tag it annually).
+
+**Measured coverage, which is what drove those choices:** `revenue`,
+`net_income`, `equity`, `assets`, `cash` and `operating_cash_flow` resolve for
+100% of annual filings; `eps_diluted` 90% (BRK.B absent); `liabilities` 87%
+(AMZN absent); `long_term_debt` and `capex` 70%. Every gap is real reported
+behaviour, so charts render a gap and name the missing field rather than
+substituting zero — a zero is a claim about the business, a gap is a claim about
+the filing.
+
+**Verified offline (no stack required):** `verify_kpis.py` runs clean across all
+10 tickers — 7/7 charts for eight of them, 6/7 for AMZN, 5/7 for BRK.B, exactly
+as the coverage predicts. All 70 figures build with zero failures. Spot-checked
+against the real filings: AAPL FY2024 revenue $391.04B and diluted EPS $6.08,
+JPM FY2024 EPS $19.75, BRK.B's FY2022 net loss of −$22.82B, and JPM's D/E of
+~11x with negative operating cash flow in FY2024-25 (correct for a bank, not a
+bug). Chart colours were run through a colour-vision-deficiency validator rather
+than picked by eye: worst-pair separation 24.7 and 21.6 against a target of 8.
+
+**One compose change, confined to the `dashboard` service:** a `./dashboard:/app`
+bind mount, so Streamlit's auto-reload picks up an edit without a rebuild. The
+kafka, elasticsearch, spark and producer service blocks were not touched.
+
+**Blocked: Docker cannot start on this machine, and it is not a Docker problem.**
+Docker Desktop 29.7.2 is installed (at the per-user path
+`%LOCALAPPDATA%\Programs\DockerDesktop`, so `docker` is **not on PATH** — the CLI
+has to be called by full path). The daemon never comes up. Diagnosis:
+
+- BIOS virtualization is **fine** — `Virtualization Enabled In Firmware: Yes`,
+  SLAT supported.
+- The **Virtual Machine Platform** Windows feature is **not enabled**, so
+  `HypervisorPresent` is `False` and the WSL2 backend cannot start.
+- The `Ubuntu` distro is registered as **WSL version 1**; Docker requires 2.
+
+Fix needs administrator rights and a reboot, so it could not be done from the
+session:
+
+```powershell
+# elevated PowerShell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+# then REBOOT, then:
+wsl --update
+wsl --set-default-version 2
+```
+
+**Consequence for what is claimed above:** the KPI arithmetic and the figure
+building are verified; the Elasticsearch layer (`es_client.py`) and the Streamlit
+UI (`app.py`) have **never been executed against a running stack**. Both compile,
+neither has run. `.env` does not exist on this machine yet either.
+
+**Next session picks up at:** confirm `docker info` responds, then
+`Copy-Item .env.example .env` → `docker compose up -d` →
+`docker compose run --rm producer` →
+`docker compose --profile jobs run --rm -e LLM_ENABLED=false spark` →
+`docker compose up -d --build dashboard` → open `localhost:8501`. The
+`LLM_ENABLED=false` is deliberate: the seven charts need no API key, and the free
+token budget is worth saving for stage 3.
+
+**Stage 3 (the graded AI capability) is not started.** The plan is a
+dashboard-side analyst producing BUY/SELL/HOLD grounded on the seven KPIs
+computed here, kept separate from Spark's existing `stock_analysis` (which is
+grounded on price anomalies instead), with facts and LLM interpretation visually
+separated and an educational-use disclaimer.
+
+### 2026-08-11 — Docker unblocked, stack verified live, analyst switched to Gemini (Vilan)
+
+Closes the blocker in the entry above. The stack now comes up on this machine and
+`scripts/verify_stack.sh` returns **8 PASS, exit 0**.
+
+**The previous entry's diagnosis was half right, and the wrong half cost time.**
+Enabling Virtual Machine Platform and rebooting was necessary and did work
+(`HyperVisorPresent` became `True`, `vmcompute` / `HvHost` / `LxssManager`
+running). But two separate faults remained, and they produced two different
+errors that each looked like the other's cause:
+
+| Symptom after the reboot | Actual cause |
+|---|---|
+| `wsl --update` → `Catastrophic failure` | WSL was still the **legacy inbox build** (`wslclient.dll` 10.0.19041.3636; `wsl --version` rejected as an invalid option). On that build `--update` goes through the Microsoft Store, and the Store path is broken here. |
+| `wsl --set-version Ubuntu 2` → `The system cannot find the path specified` | **`System32\lxss\tools\kernel` did not exist** — `wsl --status` said so plainly ("The WSL 2 kernel file is not found"). Separately, the `Ubuntu` registration was an orphan: its `BasePath` was gone and no `CanonicalGroupLimited*` package directory existed. |
+
+**Ubuntu's WSL version was a red herring.** Docker Desktop creates and uses its
+own `docker-desktop` distro, so it never needed Ubuntu at any version. Chasing
+`--set-version` was wasted effort; the missing kernel was the whole problem.
+
+**Fix: the standalone WSL MSI, which bypasses the Store entirely.**
+`wsl.2.7.11.0.x64.msi` from the `microsoft/WSL` GitHub releases (247 MB,
+Authenticode signature verified as Microsoft Corporation before running it),
+installed from an elevated shell. Result: `wsl --version` reports **WSL 2.7.11.0,
+kernel 6.18.33.2-2**, and the kernel now lives under `C:\Program Files\WSL`
+(`system.vhd`) rather than the old `System32\lxss\tools` path — so a `False` from
+`Test-Path` on the old location is now expected, not a failure.
+
+**`/passive` silently ate the error; `/qn` did not.** The first install run
+printed a progress bar, closed, and installed nothing — the Windows Installer
+event log showed a transaction that began and ended in the same second with no
+success or failure event. Re-running with `/qn` and `/l*v` succeeded (`ExitCode:
+0`, `Installation completed successfully`). If this MSI ever needs reinstalling,
+use `/qn` with a verbose log.
+
+**This machine cannot use the Hyper-V backend at all.** Docker Desktop 4.86.0 is
+a **per-user** install (`%LOCALAPPDATA%\Programs\DockerDesktop`, no
+`com.docker.service`), so WSL 2 is the only available backend and fixing WSL was
+mandatory rather than one option among two.
+
+**RUNBOOK section C cannot be honoured on this hardware.** It asks for ≥8 GB given
+to Docker; the machine has **7.9 GB of RAM in total**. Worked around with a
+host-level `~/.wslconfig` (`memory=5GB`, `processors=6`, `swap=4GB`), which is
+enough for Elasticsearch (`-Xms1g -Xmx1g`) + Kafka + kafka-ui + dashboard.
+`docker-compose.yml` was **not** touched — trimming, when needed, is
+`docker compose stop kafka-ui` at runtime, and only *after* `verify_stack.sh`,
+whose third check probes port 8080.
+
+**`verify_stack.sh` reports five false FAILs under Git Bash.** On a completely
+healthy stack the first run gave 3 PASS / 5 FAIL, and every failure was a check
+routed through `docker compose exec -T kafka /opt/kafka/bin/...`. Cause: MSYS
+rewrites Unix-looking arguments into Windows paths, so the script's in-container
+path arrives mangled. `check()` runs `eval "$cmd" >/dev/null 2>&1`, which hides
+the real error and makes it look like a dead broker. Confirmed by running the
+same command directly (exit 0, three topics listed) and by
+`docker compose logs topic-init` (three `CREATED` lines). With
+`MSYS_NO_PATHCONV=1` the script returns **8 PASS**. Documented in RUNBOOK step 2;
+the script itself is correct for the Linux/macOS teammates it was written for and
+was left alone.
+
+**Analyst stage switched from Groq to Gemini — in the local `.env` only.**
+`LLM_PROVIDER=gemini`, and `LLM_FALLBACK_PROVIDERS` emptied, since leaving
+`gemini` there made the provider its own fallback (a chain that cannot help: the
+same exhausted key). Key verified against the Gemini models endpoint — valid, 52
+models reachable, and the shipped default `gemini-3.6-flash` is among them.
+**`.env.example` was deliberately not changed**, so the team default stays
+`groq`; switching that is a team decision. Practical consequence for whoever
+picks this up: Gemini's free tier is ~30 calls/day and a run spends 10, so this
+machine gets roughly **3 full analyst runs per day** versus ~7 on Groq. Use
+`LLM_ENABLED=false` while iterating.
+
+**Verified 2026-08-11:** WSL 2.7.11 with a working kernel; Docker daemon 29.7.2;
+`docker run hello-world` clean; `kafka` and `elasticsearch` both `(healthy)`;
+`topic-init` exited 0 having created all three topics; `kafka-ui` and `dashboard`
+up; `verify_stack.sh` **8 PASS / exit 0**; `python dashboard/verify_kpis.py`
+exit 0 with the documented 7/7, 6/7 (AMZN), 5/7 (BRK.B) split.
+
+**Still not done, and the next session's binding constraint is disk.** Free space
+on C: fell from 12.1 GB to **2.8 GB** across the image pulls and builds
+(`docker_data.vhdx` is 6.95 GB: 4.5 GB images, 1.46 GB build cache of which
+844 MB is reclaimable). The `spark` image has **not** been built yet — it is
+profile-gated — and will want roughly 1.5–2 GB, so `docker compose --profile jobs
+run --rm spark` is likely to fail on space until something is reclaimed. No
+producer or Spark run has happened, so all four Elasticsearch indices are still
+absent and `es_client.py` / `app.py` remain **unverified against populated
+indices** — the dashboard container runs, but there is nothing yet for it to read.
+
+### 2026-08-11 — Stage 3: the dashboard's own AI analyst (Vilan)
+
+The graded AI capability, previously listed as not started. BUY/HOLD/SELL grounded
+on the **seven fundamentals KPIs**, deliberately separate from the Spark analyst,
+which is grounded on price anomalies. Both are now rendered in the page, labelled,
+and free to disagree — a disagreement between two different evidence bases is a
+finding, not a defect.
+
+| file | role |
+|---|---|
+| `dashboard/ai_analyst.py` (new) | evidence assembly, prompt, transport, response contract. **Imports no Streamlit**, for the same reason `kpis.py` does not: it can be exercised from a terminal |
+| `dashboard/prompts/analyst_fundamentals.md` (new) | the prompt. 8 rules and the JSON contract |
+| `dashboard/verify_ai.py` (new) | offline harness — evidence + prompt from parquet, with an opt-in single live call |
+| `dashboard/app.py` | the panel: computed facts, then the model's words, then Spark's note, each in its own block |
+
+**The response contract is byte-identical to `spark/llm.py`'s** (`recommendation`,
+`confidence`, `key_risks`, `signals`, `summary`, with the same three-value
+enums), so `app.py` renders both analysts through one code path rather than two
+near-duplicates.
+
+**What is deliberately *not* copied from `spark/llm.py`: the retry policy.** That
+client backs off for up to 60s because it runs unattended in batch. A page a human
+is watching must not freeze for a minute, so here a 429 is surfaced immediately —
+with the provider's own retry-after when it sends one — and the decision to try
+again belongs to the person looking at the screen. The transport itself *is*
+duplicated rather than imported, because `spark/` and `dashboard/` are separate
+images with no shared package; the parts that were learned the hard way carry
+comments saying so, including the explicit User-Agent (urllib's default is
+rejected by Cloudflare in front of Groq as a 403 that reads like an auth failure).
+
+**One call per click, not per page render.** Streamlit re-runs the entire script on
+every widget change, so an automatic call would fire a request each time the
+fiscal-year slider moved — and Gemini's free tier is ~30 calls/day. The answer is
+held against a SHA-256 digest of the exact prompt, so re-reads, ticker switches
+back and forth, and every unrelated interaction cost nothing, while a genuine
+change of inputs correctly produces a new prompt and re-enables the button.
+
+**No new dependency.** The transport is `urllib.request` from the standard
+library, the same choice `spark/llm.py` made, so `dashboard/requirements.txt` is
+untouched and the image did not need rebuilding — the `./dashboard:/app` bind
+mount picked all four files up live.
+
+**Every metric states its own `value_field`, and the two harnesses are checked
+against each other.** The evidence rows carry every column of a KPI's frame, not
+just the headline one, and a supporting input can outlive the metric it feeds:
+AMZN's `debt_equity` rows hold a real `equity` figure every year and never a
+`debt_to_equity`, because total liabilities are not tagged and there is nothing
+to divide. Naming the value column stops a model reading a supporting input as
+the metric, and rule 5 of the prompt says so explicitly. `verify_ai.py` counts
+coverage on that field, which is what keeps it in exact agreement with
+`verify_kpis.py` — a disagreement between the two is the signal that one of them
+is wrong.
+
+**Verified 2026-08-11:**
+
+- `python dashboard/verify_ai.py` — exit 0, all 10 tickers, and the coverage
+  split matches `verify_kpis.py` exactly.
+- `python dashboard/verify_ai.py --call` — one live Gemini call for AAPL passed
+  the contract: `buy` / `confidence: low`, 4 signals, 3 risks, citing FY25 net
+  income of $112.01B and diluted EPS of $7.46. It gave thin price history as the
+  reason for low confidence — i.e. it obeyed the rule that weak data lowers
+  `confidence` rather than collapsing the answer to `hold`.
+- `python dashboard/verify_kpis.py` — exit 0.
+- `python -m py_compile` clean on all six dashboard modules; every Streamlit API
+  the panel uses confirmed present in the container's Streamlit 1.36.0.
+
+**The honest gap: the panel has never been rendered in a browser.** `app.py` stops
+early while `stock_filings` is empty, so the AI section is unreachable until a
+producer + Spark run populates the indices — which needs the disk headroom
+described in the entry above. What is verified is every layer beneath the
+rendering: evidence assembly, prompt assembly, transport, parsing, contract
+validation, and the Streamlit API surface. What is not verified is the layout
+itself.
+
+### 2026-08-11 — Chart 2: buyback, and a share price chart per company (Vilan)
+
+**Chart 2 is the buyback view:** how many shares the company has, and whether it
+added to or reduced that number over the years shown.
+
+**Field: `shares_outstanding`, not `shares_diluted`.** Diluted is a weighted
+average that also counts options, RSUs and convertibles — instruments that are
+not shares yet — and being an average it smears changes that happened inside the
+year. "How many shares exist" is answered by the actual count.
+
+**Coverage cost, accepted rather than papered over:** META tags no
+`shares_outstanding` at all and BRK.B tags neither share field, so both get an
+explicit empty chart; TSLA is missing FY2021. Filling META from `shares_diluted`
+was rejected — substituting a *different measure* under this chart's heading is
+worse than an honest gap, by the same rule that stops this module substituting
+zero for a missing fact. Coverage is 79% of annual filings against diluted's 84%,
+and that 5 points is the price of the definition being right.
+
+**Split adjustment is the substance of the work.** Each year's count comes from
+that year's own filing, so a pre-split year reports pre-split shares. Raw, the
+data claims NVDA issued **+894%** more shares in FY2025 and AMZN **+1,912%** in
+FY2022. Those are a 10:1 and a 20:1 split — events that change the share count
+without changing what anyone owns, i.e. the exact opposite of the question the
+chart asks. Every year is now restated on the latest year's basis, and each split
+found is named in the notes rather than silently applied.
+
+**Measured jumps are snapped to a declared split ratio, not used raw.** AVGO's
+count jumps by a measured 11.32x across its 10:1 split. Dividing history by 11.32
+would deflate it by 13% and erase the fact that AVGO genuinely issued ~13% more
+shares that year for the VMware acquisition. Snapping to exactly 10 leaves that
+13% standing where it belongs. `SPLIT_RATIOS` therefore holds only ratios issuers
+actually declare — padding it with unusual values lets a numerically closer but
+fictional ratio win and corrupts every year before the split.
+
+**The year-on-year change is computed only between *consecutive* fiscal years**,
+so TSLA's missing FY2021 cannot let a two-year move be labelled as one year's.
+
+**The seven metrics now come from `stock_filings` alone**, so `compute_all`'s
+`prices` parameter is unused by them and has been made optional. Prices are read
+by the new share price chart below instead.
+
+### The share price chart
+
+Every company now carries its own price chart above the fundamentals, with a
+window selector: **1W, 1M, 3M, 6M, 1Y**. It is the only chart on the page drawn
+against a real time axis (`kpis.price_view` + `charts.price_chart`).
+
+**The window is measured back from the most recent bar in the data, not from
+today.** The snapshot is replayed history with a fixed end (2024-08-05 →
+2026-08-03), so wall-clock "today" drifts away from it: asking for the last seven
+days of real time returns nothing once the snapshot is a week old, and the chart
+would look broken when it is merely historical. The caption states the dates
+actually covered so nobody checks it against a live quote and concludes the
+dashboard is wrong.
+
+**Two deliberate departures from the KPI charts**, both the opposite of the rule
+the other seven follow:
+
+- **A line, not bars.** Consecutive trading days really are adjacent, so a
+  segment between two points is not an interpolation across unmeasured time the
+  way it would be between two fiscal years.
+- **No zero baseline.** A share price has no meaningful zero, and on a one-week
+  window a zero-based axis flattens every price into a single line. An area fill
+  was dropped for the same reason: `fill="tozeroy"` drags the axis back to zero
+  to accommodate the fill, undoing the choice.
+
+Direction is carried by colour **and** by the percentage printed in the chart
+title, never by colour alone — the same CVD rule the rest of the palette follows.
+
+### 2026-08-11 — The AI panel takes an emphasis note from the reader (Vilan)
+
+One optional text field above the Generate button, appended to the prompt as an
+emphasis note: "focus on leverage", "explain it for a non-specialist", "weigh the
+share count trend most heavily".
+
+**Scoped to wording, and the scope is stated to the model rather than assumed.**
+The note lands in its own `## The reader's emphasis` section, placed **after** the
+data so it cannot be mistaken for part of it, under a frame saying it governs
+emphasis and wording only — it cannot change the metrics, the rules for reading
+them, the JSON contract, or add information the model was not given, and if it
+asks for something the data cannot support the model is told to say so in
+`summary`.
+
+**Why not a freely editable prompt.** The rules it sits beneath are load-bearing:
+rule 5 is what stops a model reading `shares_reported` and announcing a stock
+split as a 900% share issue, rule 3 is what makes a rising share count read as
+dilution rather than growth, and rule 2 is what stops a missing fact being read as
+zero. An instruction able to displace those would not give a worse answer, it
+would give a confidently wrong one. Free-form text also has nothing holding it to
+the JSON contract, so the structured panel would fail to render rather than
+degrade. A full prompt swap remains available on purpose through
+`DASHBOARD_PROMPT_PATH`.
+
+**Implementation notes.** The note is whitespace-collapsed and capped at 500
+characters. The cached answer is keyed on a digest of the whole prompt, which now
+includes the note, so changing the emphasis correctly re-enables the button and
+buys a new answer while re-reading an existing one stays free. The instruction is
+returned as `focus_used` and displayed beside the answer — an emphasised note read
+without knowing what it was asked to emphasise invites a requested slant to be
+mistaken for a finding.
+
+**Verified 2026-08-11:** blank, whitespace-only and `None` notes leave the prompt
+byte-identical; a note is collapsed to one line and appended after the data; the
+cap holds exactly at the boundary (501 chars in → 502 out with an ellipsis, 900 →
+502). One live call with *"Weigh the share count trend most heavily, and explain
+it for someone with no finance background"* returned a valid contract (`buy` /
+`high`, 4 signals, 2 risks) with the share-count reduction promoted to the **first**
+signal and the summary explaining a buyback in plain language — while still
+quoting the split-adjusted figures, so rule 5 held with the note in place.
+`python dashboard/verify_ai.py --focus "..."` exercises the same path offline.
+
+**Verified 2026-08-11**, with the adjusted series checked against what each
+company actually did:
+
+- AAPL −13.0% over five years, JPM −11.6%, GOOGL −10.5% — real buybacks, no split
+  in the window for AAPL or JPM, a 20:1 detected for GOOGL.
+- NVDA — both splits found (4:1 at FY2022, 10:1 at FY2025); the adjusted series
+  sits at ~24.5–25B throughout and moves ±1–2%, which is the actual buyback.
+- AVGO +16.5% overall, with the +13.2% landing in FY2024 where the acquisition
+  was. TSLA +30.2% overall, +16.6% in FY2025 — issuance, and labelled as such.
+- `verify_kpis.py` and `verify_ai.py` both exit 0 and agree: 7/7 for seven
+  tickers, 6/7 for AMZN (no `liabilities`) and META (no `shares_outstanding`),
+  5/7 for BRK.B (neither EPS nor shares). `py_compile` clean on all six modules.
+
+**Unchanged:** README needed no edit — it never enumerated the charts, and no
+service, port, index or `.env` variable moved. The panel still has not rendered
+in a browser, for the same reason as the entry above.
