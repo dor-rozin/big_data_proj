@@ -206,7 +206,7 @@ tags and the security tradeoffs behind this stack are recorded in
 | `schemas/`    | Frozen Kafka message contract                  | Person A  |
 | `scripts/`    | Operational helper scripts                     | Person A  |
 | `spark/`      | Transform + MLlib anomalies + LLM analyst + ES load | Dor  |
-| `dashboard/`  | Streamlit dashboard over the four indices      | Person C  |
+| `dashboard/`  | Streamlit dashboard over the four indices      | Ohad  |
 
 Each stage passes data by a defined schema, so the three parts can be built and
 tested independently. The Spark half is split across small modules:
@@ -220,6 +220,23 @@ tested independently. The Spark half is split across small modules:
 | `spark/es_writer.py` | Streamed, batched, idempotent Elasticsearch load |
 | `spark/prompts/analyst.md` | The analyst prompt — edit this, not the code |
 | `spark/pipeline.py` | Orchestrates the five stages |
+
+The dashboard half:
+
+| File | Responsibility |
+|---|---|
+| `dashboard/es_client.py` | Reads Elasticsearch. No arithmetic, no plotting |
+| `dashboard/kpis.py` | The seven fundamental KPIs. No Elasticsearch, no plotting |
+| `dashboard/charts.py` | The KPI figures |
+| `dashboard/indicators.py` | CCI / Stochastic / MACD maths, ported from the `infra` project |
+| `dashboard/woodies_chart.py` | The four-row candles + CCI + Stoch + MACD figure |
+| `dashboard/ai_analyst.py` | The fundamentals-based analyst (separate from the Spark one) |
+| `dashboard/app.py` | Wiring and layout only |
+
+Under the share-price chart, **"See more details"** opens the four-row Woodies
+view: candles, Woodies CCI with its trend-coloured histogram, Stochastic %K/%D
+and MACD, sharing one time axis. All nine indicator periods are adjustable
+there. It is collapsed by default and computes nothing until it is opened.
 
 The Kafka message contract for the reworked producer stage — field tables,
 nullability, and the UTC/uppercase-ticker/zero-padded-CIK rules — is frozen in
