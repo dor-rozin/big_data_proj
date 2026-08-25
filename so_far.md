@@ -13,7 +13,7 @@ To actually run the thing end to end with validation at every step, use
 | `producer/` — snapshot replay → Kafka | Amir | Runs end-to-end | Backfill + live modes both verified against a live broker: exact delivery counts, correct partitioning, headers intact. Now merges three sources (prices, filings, press-release text). Automated tests / `producers/` layout from ticket 0007 still outstanding |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
 | `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
-| `dashboard/` — Streamlit | Vilan | Code written, not verified | Rewritten 2026-08-11 into 5 modules (`kpis` / `es_client` / `charts` / `app` / `verify_kpis`) for 7 fundamentals charts. KPI arithmetic verified offline against the parquet snapshot. Docker on this machine is **no longer blocked** (WSL 2.7.11 installed 2026-08-11, stack verified 8 PASS) and the `dashboard` container now runs, but no producer/Spark run has happened yet, so `es_client.py` and `app.py` are still **unverified against populated indices** — see the second 2026-08-11 log entry |
+| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart |
 | AI capability — dashboard-side analyst | Vilan | Code written, not verified | Built 2026-08-11: `dashboard/ai_analyst.py` + `prompts/analyst_fundamentals.md`, rendered by an AI panel in `app.py`. BUY/HOLD/SELL grounded on the 7 computed KPIs, separate from Spark's `stock_analysis`. Evidence and prompt verified offline for all 10 tickers, and one live Gemini call passed the contract — but **the panel has never rendered in a browser**, because that needs populated indices and no Spark run has happened on this machine yet |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
 | `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Joins `sec.filings.v1` by `cik` + `filed_date` window, **never** `accession_no` (0 shared accessions — contract corrected 2026-08-06, see log) |
@@ -44,6 +44,7 @@ add tests for an area; if an area has no row, there is nothing to run for it.
 | `spark/` — analyst context capture | `docker compose --profile jobs run --rm -e LLM_ENABLED=false spark` then `curl -s localhost:9200/stock_context/_count` — must be 10, and `ls llm_output/_prompts/` must hold 10 files. Costs no API quota; this is the check to run while iterating on the prompt. |
 | Full stack — clean end-to-end run | Follow [RUNBOOK.md](RUNBOOK.md) top to bottom. It states the expected output for every step, so a mismatch anywhere is the failure point. Ends with an idempotency check. |
 | `spark/` — provider chain | `docker compose --profile jobs run --rm spark`. The banner shows the chain (`groq -> gemini`), and the closing `produced by:` line names which model wrote each analysis. Every row in `stock_analysis` must carry `provider_used`. |
+| `dashboard/` — indicator sub-panels | `cd dashboard && python3 verify_indicators.py` — asserts the warm-up reaches the left edge, every visible bar survives `_hide_gaps`, all traces collapse onto `x4` and all 8 guide lines are re-pointed. Reads the parquet snapshot; needs no Docker or Elasticsearch. |
 | `spark/` — runs without a key | `docker compose --profile jobs run --rm -e GROQ_API_KEY= -e GEMINI_API_KEY= spark` — must exit 0, skip stage 4 with a clear message, and still write `stock_prices`, `stock_filings` and `stock_context`. This is the path every new teammate hits first. |
 | `spark/` — fallback triggers | Force a retirement and confirm the run still finishes: `-e GROQ_API_KEY=bad` (auth → retire on row 1, all rows via the fallback), or `-e LLM_FALLBACK_PROVIDERS=ollama` without starting the container (unreachable → retire, no fallback left, rows recorded as failures). Neither may hang. |
 | `spark/` — schema-drift guard | Rename a field in a `StructType` in `spark/schemas.py` (e.g. `ts` → `date`) and re-run. `assert_parsed` must fail naming the topic, rather than the job exiting 0 having produced nothing. |
@@ -1619,3 +1620,62 @@ company actually did:
 **Unchanged:** README needed no edit — it never enumerated the charts, and no
 service, port, index or `.env` variable moved. The panel still has not rendered
 in a browser, for the same reason as the entry above.
+
+### 2026-08-25 — Woodies CCI / Stochastic / MACD sub-panels ported into the dashboard (Dor)
+
+Ported the four-row technical view from the separate `infra` project so the
+sub-panels here are pixel-for-pixel identical to the ones there: candles,
+Woodies CCI, Stochastic %K/%D, MACD on one shared time axis. The maths, the
+default parameters, the colours, the row heights and the axis-finishing sequence
+came over as a specification rather than a starting point, and
+`dashboard/indicators.py` says so at the top — the two defaults that look like
+typos (%K smoothing of 6, not 3) are deliberate.
+
+- `dashboard/indicators.py` (new) — `compute_cci`, `_trend_state`,
+  `woodies_cci`, `trend_label`, `stochastic_kd`, `macd_lines`, `warmup_bars`.
+  Imports no Streamlit, so it is checkable from the command line.
+- `dashboard/woodies_chart.py` (new) — the figure, plus `bars_frame` /
+  `prepare_frames` glue that adapts this project's Elasticsearch documents to
+  the spec's bars frame and applies the warm-up rule.
+- `dashboard/verify_indicators.py` (new) — offline check against the parquet
+  snapshot, matching the `verify_kpis.py` / `verify_ai.py` pattern.
+- `dashboard/app.py` — a **"See more details"** expander directly under the
+  share-price chart, collapsed by default, with all nine periods as inputs. No
+  sidebar entry, and Streamlit runs nothing inside a closed expander.
+
+**Warm-up is the part that looks skippable and is not.** Indicators are computed
+on a frame extending `warmup_bars * 2` rows *before* the visible window and then
+tail-trimmed, so CCI(14), %K(14)+6+3 and MACD(26,9) are all warm at the leftmost
+visible candle instead of starting blank. `warmup_bars` comes out at 40 on
+defaults, matching the source project's stated figure.
+
+**Bug found on the first render: 126 bars drawn as 24.** `_hide_gaps` collapses
+weekends by laying a uniform one-day grid and hiding every slot not on it. This
+project's `ts` is midnight *Eastern* expressed in UTC, so it sits at 04:00 under
+EDT and 05:00 under EST — 331 vs 169 bars on the AAPL snapshot — and half the
+year falls off that grid and is hidden as a "gap". The spec's `_hide_gaps` is
+untouched and correct; its uniform-spacing assumption simply is not true of this
+data, so `bars_frame` normalises `ts` to midnight, which is the right x value for
+a daily bar anyway. Worth remembering because **the indicator maths never reads
+`ts`**, so every number was correct throughout and the symptom reads purely as a
+plotting fault. `verify_indicators.py` asserts `days_in_span - hidden_slots ==
+visible_bars`; confirmed against a negative control that the assertion fails
+(24 vs 126) without the normalisation.
+
+**Marker overlays removed at review.** The CCI x Turbo crossing X's and the
+zero-line-reject triangles were implemented per the spec and then dropped — the
+two lines plus the trend-coloured histogram carry the signal without them.
+`line_crossings` was deleted with them rather than left as dead code;
+`woodies_cci` still returns `zlr_long`/`zlr_short` because that function is
+ported verbatim and the columns are part of its contract.
+
+**Verified:** `verify_indicators.py` passes 10/10 tickers (warm at the left edge,
+every bar drawn, all 9 traces collapsed onto `x4`, all 8 guide lines re-pointed
+to `x4 domain`). `verify_kpis.py` and `verify_ai.py` still pass 10/10. Dashboard
+rebuilt and serving 200 with no errors, and the figure builds from live
+Elasticsearch as well as from the parquet snapshot.
+
+Also fixed two stale spots in `.env.example` that predate this work: the backfill
+split still read 3,375/2,538 where the README correctly says 3,435/2,594 after
+ticket 0010, and an orphaned `# Spark — Gemini analyst stage` header left over
+from the provider-chain rewrite.

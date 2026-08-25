@@ -38,7 +38,9 @@ import streamlit as st
 import ai_analyst
 import charts
 import es_client
+import indicators
 import kpis
+import woodies_chart
 
 st.set_page_config(page_title="Financial KPIs & AI Analyst",
                    page_icon="📊", layout="wide")
@@ -200,6 +202,73 @@ if view.available:
                      else f"{view.change_pct:+.1f}% over {window}")
     for note in view.notes:
         st.caption(f"⚠️ {note}")
+
+    # -----------------------------------------------------------------------
+    # Woodies CCI sub-panels, collapsed by default.
+    #
+    # Behind an expander rather than on the page: it is a 1050px four-row
+    # technical chart with nine tunable parameters, which is a different kind of
+    # question from the fundamentals below it. Nothing is computed until it is
+    # opened — Streamlit does not run the body of a closed expander.
+    # -----------------------------------------------------------------------
+    with st.expander("See more details — Woodies CCI, Stochastic, MACD"):
+        _p = dict(indicators.DEFAULTS)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.caption("**CCI**")
+            _p["cci_period"] = st.number_input(
+                "CCI period", 2, 100, _p["cci_period"], key=f"cci-{ticker}")
+            _p["turbo_period"] = st.number_input(
+                "Turbo period", 2, 100, _p["turbo_period"], key=f"turbo-{ticker}")
+            _p["trend_bars"] = st.number_input(
+                "Trend confirm bars", 2, 30, _p["trend_bars"], key=f"tb-{ticker}")
+        with c2:
+            st.caption("**Stochastic**")
+            _p["stoch_k"] = st.number_input(
+                "%K period", 1, 100, _p["stoch_k"], key=f"sk-{ticker}")
+            _p["stoch_k_smooth"] = st.number_input(
+                "%K smoothing", 1, 50, _p["stoch_k_smooth"], key=f"sks-{ticker}")
+            _p["stoch_d"] = st.number_input(
+                "%D period", 1, 50, _p["stoch_d"], key=f"sd-{ticker}")
+        with c3:
+            st.caption("**MACD**")
+            _p["macd_fast"] = st.number_input(
+                "Fast EMA", 1, 100, _p["macd_fast"], key=f"mf-{ticker}")
+            _p["macd_slow"] = st.number_input(
+                "Slow EMA", 2, 200, _p["macd_slow"], key=f"ms-{ticker}")
+            _p["macd_signal"] = st.number_input(
+                "Signal", 1, 100, _p["macd_signal"], key=f"msig-{ticker}")
+
+        _bars = woodies_chart.bars_frame(prices)
+        if _bars is None:
+            st.info("Price documents carry no OHLC — the sub-panels need "
+                    "`open`/`high`/`low`/`close`.")
+        else:
+            _ind_df, _df, _short = woodies_chart.prepare_frames(
+                _bars, view.data["date"], **_p)
+
+            # Readout strip — the Woodies "numbers" line above the sub-panels.
+            _fig, _wdf = woodies_chart.build_figure(
+                _ind_df, _df, ticker, **_p)
+            _last = _wdf.iloc[-1]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(f"CCI ({int(_p['cci_period'])})", f"{_last['cci']:.2f}")
+            m2.metric(f"Turbo ({int(_p['turbo_period'])})", f"{_last['turbo']:.2f}")
+            m3.metric("Trend", indicators.trend_label(_last["trend"]),
+                      f"{int(_last['trend_count'])} bars")
+            m4.metric("Last close", f"{_df['close'].iloc[-1]:.2f}")
+
+            st.plotly_chart(_fig, use_container_width=True,
+                            key=f"{ticker}-woodies-{window}")
+
+            if _short:
+                # A short warm-up is visible as a blank left edge. Saying so
+                # beats letting a reader conclude the indicator is broken.
+                st.caption(
+                    f"⚠️ {_short} warm-up bar(s) short — the snapshot does not "
+                    f"reach far enough before this window, so the leftmost "
+                    f"values are still settling. Pick a shorter window for a "
+                    f"fully warm chart.")
 else:
     st.info(f"No price bars for {ticker} in `{es_client.PRICES_INDEX}`.")
 
