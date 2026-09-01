@@ -36,6 +36,7 @@ from __future__ import annotations
 import pandas as pd
 import plotly.graph_objects as go
 
+import woodies_chart
 from kpis import KPI, RULE_OF_40_THRESHOLD
 
 # ---- palette (validated; see the module docstring) ------------------------
@@ -412,6 +413,18 @@ def price_chart(view, ticker: str = "") -> go.Figure:
     rule the KPI charts follow. A share price has no meaningful zero and the
     question here is the shape of the move, not its size against nothing; on a
     one-week window a zero-based axis would flatten every price into one line.
+
+    A **vertical crosshair** follows the cursor and snaps to trading days. It is
+    the only chart on the page where reading an individual point off the line is
+    a real question — the KPI charts have five labelled bars, this one has up to
+    a year of closes and no room to label them.
+
+    Non-trading days are removed from the axis rather than drawn as empty space.
+    This is not a breach of the module's 'a gap in the data is drawn as a gap'
+    rule: that rule is about a fact a company did not report, where the empty
+    space carries the meaning. A weekend is not a missing observation, it is time
+    in which no observation can exist, and drawing a flat segment across it
+    invents two days of unchanged price that were never traded.
     """
     if view is None or not view.available:
         return _empty(f"{ticker} share price".strip(),
@@ -425,16 +438,61 @@ def price_chart(view, ticker: str = "") -> go.Figure:
     if change is not None:
         title += f"   {change:+.1f}%"
 
+    # Truncate each bar to its calendar date before drawing or collapsing.
+    #
+    # `ts` on this project's daily bars is midnight *Eastern* expressed in UTC,
+    # so it lands at 04:00 under EDT and 05:00 under EST — 166 and 85 bars on a
+    # one-year AAPL window. `_hide_gaps` lays a uniform one-day grid from the
+    # first bar's clock time, so without this every bar on the other side of the
+    # DST switch falls off that grid and is hidden as a "gap": 251 trading days
+    # collapse to 52. `bars_frame` normalises for the same reason, and both
+    # 04:00Z and 05:00Z resolve to the trading day they already represent.
+    x = (pd.to_datetime(d["date"], errors="coerce", utc=True)
+           .dt.tz_localize(None).dt.normalize())
+
     fig = go.Figure(go.Scatter(
-        x=d["date"], y=d["close"], mode="lines",
+        x=x, y=d["close"], mode="lines",
         line=dict(color=colour, width=2),
-        hovertemplate="%{x|%d %b %Y}<br>$%{y:,.2f}<extra></extra>",
+        # The date is the unified box's own header, so the row under it carries
+        # only the price — repeating the date would just make the box taller.
+        hovertemplate="Close  $%{y:,.2f}<extra></extra>",
         name="Close",
     ))
     _base_layout(fig, title, "USD")
     # _base_layout pins the x-axis to `type="category"` for the fiscal-year
     # charts. This is the one chart with a real time axis, so it is put back.
-    fig.update_xaxes(type="date", showgrid=False)
+    fig.update_xaxes(type="date", showgrid=False, hoverformat="%a %d %b %Y")
+
+    # The crosshair: a vertical rule that tracks the cursor and reads out the
+    # trading day under it.
+    #
+    # `hovermode="x unified"` with `hoverdistance=-1` is what makes it feel
+    # pinned. Plotly's default ("closest") only answers when the cursor is
+    # within a few pixels of the line itself, so on a chart whose line wanders
+    # across the height of the panel the reader has to chase it. Unbounded
+    # distance means anywhere in the plot area — top corner included — reads the
+    # nearest trading day, and the readout is one box: date as the header, close
+    # beneath it.
+    #
+    # `spikesnap="hovered data"` is the "existing points only" part of the
+    # request. The rule lands on the bar being reported rather than on the raw
+    # cursor x, so it steps from one trading day to the next instead of sliding
+    # continuously, and never stands between two closes.
+    fig.update_layout(hovermode="x unified", hoverdistance=-1, spikedistance=-1)
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="hovered data",
+                     spikecolor=MUTED, spikethickness=1, spikedash="dot")
+
+    # Collapse the weekends and market holidays out of the axis, reusing the
+    # Woodies panel's routine rather than a second copy of the same arithmetic.
+    #
+    # Sharing it is the point, not a shortcut. `app.py` drives that panel from
+    # this view's own dates, so the two charts are stacked showing the same days
+    # under the same window selector; if only one of them collapsed its gaps, a
+    # given date would sit at a different horizontal position in each, and
+    # dropping your eye from a price move to that day's CCI or MACD reading
+    # would land on the wrong bar. Two implementations of the compression would
+    # drift apart the first time either is tuned, so there is only one.
+    woodies_chart._hide_gaps(fig, x)
 
     # An explicit padded range rather than an area fill. A `fill="tozeroy"` would
     # look better and would drag the axis back down to zero to accommodate the

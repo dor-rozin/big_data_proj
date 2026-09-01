@@ -233,6 +233,12 @@ The dashboard half:
 | `dashboard/ai_analyst.py` | The fundamentals-based analyst (separate from the Spark one) |
 | `dashboard/app.py` | Wiring and layout only |
 
+The share-price chart carries a vertical crosshair. It follows the cursor
+anywhere in the panel — not only along the line — and snaps to trading days,
+reading out that day's date and close. Weekends and market holidays are
+collapsed out of its time axis, on the same grid as the Woodies panel below,
+so a date sits at the same horizontal position in both.
+
 Under the share-price chart, **"See more details"** opens the four-row Woodies
 view: candles, Woodies CCI with its trend-coloured histogram, Stochastic %K/%D
 and MACD, sharing one time axis. All nine indicator periods are adjustable

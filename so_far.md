@@ -13,7 +13,7 @@ To actually run the thing end to end with validation at every step, use
 | `producer/` — snapshot replay → Kafka | Amir | Runs end-to-end | Backfill + live modes both verified against a live broker: exact delivery counts, correct partitioning, headers intact. Now merges three sources (prices, filings, press-release text). Automated tests / `producers/` layout from ticket 0007 still outstanding |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
 | `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
-| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart |
+| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart. Price chart gained a snapping vertical crosshair and a gap-collapsed time axis 2026-09-01 |
 | AI capability — dashboard-side analyst | Vilan | Code written, not verified | Built 2026-08-11: `dashboard/ai_analyst.py` + `prompts/analyst_fundamentals.md`, rendered by an AI panel in `app.py`. BUY/HOLD/SELL grounded on the 7 computed KPIs, separate from Spark's `stock_analysis`. Evidence and prompt verified offline for all 10 tickers, and one live Gemini call passed the contract — but **the panel has never rendered in a browser**, because that needs populated indices and no Spark run has happened on this machine yet |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
 | `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Joins `sec.filings.v1` by `cik` + `filed_date` window, **never** `accession_no` (0 shared accessions — contract corrected 2026-08-06, see log) |
@@ -48,10 +48,11 @@ add tests for an area; if an area has no row, there is nothing to run for it.
 | `spark/` — runs without a key | `docker compose --profile jobs run --rm -e GROQ_API_KEY= -e GEMINI_API_KEY= spark` — must exit 0, skip stage 4 with a clear message, and still write `stock_prices`, `stock_filings` and `stock_context`. This is the path every new teammate hits first. |
 | `spark/` — fallback triggers | Force a retirement and confirm the run still finishes: `-e GROQ_API_KEY=bad` (auth → retire on row 1, all rows via the fallback), or `-e LLM_FALLBACK_PROVIDERS=ollama` without starting the container (unreachable → retire, no fallback left, rows recorded as failures). Neither may hang. |
 | `spark/` — schema-drift guard | Rename a field in a `StructType` in `spark/schemas.py` (e.g. `ts` → `date`) and re-run. `assert_parsed` must fail naming the topic, rather than the job exiting 0 having produced nothing. |
-| `dashboard/` — KPI arithmetic, offline | `python dashboard/verify_kpis.py` — rebuilds the `stock_filings` document shape straight from `historical_data/` and runs every KPI. Needs no Docker, no broker, no Elasticsearch. Expect `7/7 charts` for 8 tickers, `6/7` for AMZN (no `liabilities`) and `5/7` for BRK.B (no EPS). Add a ticker to print every number: `python dashboard/verify_kpis.py AAPL`. |
+| `dashboard/` — KPI arithmetic, offline | `python dashboard/verify_kpis.py` — rebuilds the `stock_filings` document shape straight from `historical_data/` and runs every KPI. Needs no Docker, no broker, no Elasticsearch. Expect `7/7 charts` for 7 tickers, `6/7` for AMZN (no `liabilities`) and META (no `shares_outstanding`), and `5/7` for BRK.B (neither EPS nor shares) — the same split `verify_ai.py` reports. Add a ticker to print every number: `python dashboard/verify_kpis.py AAPL`. |
 | `dashboard/` — figures build | `python -c "import sys;sys.path.insert(0,'dashboard');import verify_kpis as V,kpis,charts;f,p=V.load_filings(),V.load_prices();print(sum(1 for t in f.ticker.dropna().unique() for s,b in charts.CHART_BUILDERS.items() if b(kpis.compute_all(f[f.ticker==t],p[p.ticker==t])[s]))," figures")"` — must print 70. Catches plotly API drift between the container's 5.22 and a newer local version. |
 | `dashboard/` — AI analyst evidence + prompt, offline | `python dashboard/verify_ai.py` — builds the evidence object and the exact prompt for all 10 tickers from `historical_data/`. **No network, no quota, no Docker.** Expect `7/7 metrics with data` for eight tickers, `6/7` for AMZN, `5/7` for BRK.B — the same split `verify_kpis.py` reports, which is the point: if these two disagree, one of them has a bug. Add a ticker to print the whole prompt: `python dashboard/verify_ai.py AAPL`. |
 | `dashboard/` — AI analyst live contract | `python dashboard/verify_ai.py --call` — makes **exactly one** API call and validates the response against `REQUIRED_KEYS` / `VALID_RECOMMENDATION` / `VALID_CONFIDENCE`. Costs 1 of Gemini's ~30 daily calls. Expect a `contract OK:` line naming the recommendation, confidence, and the counts of signals and risks. With no key it prints why and exits 0 rather than failing. |
+| `dashboard/` — price-chart crosshair | `python -c "import sys;sys.path.insert(0,'dashboard');import verify_kpis as V,kpis,charts;p=V.load_prices();charts.price_chart(kpis.price_view(p[p.ticker=='AAPL'],'1W'),'AAPL').write_html('px.html')"`, then serve the folder (`python -m http.server`) and open `px.html`. A dashed vertical rule must follow the cursor, step from one trading day to the next, and read out the date and close from anywhere in the panel, including far above the line. The axis must show no weekend: on the 1W window the ticks run Mon-Fri then jump straight to the following Monday. |
 | everything else | No test framework is set up. No `tests/` directory and no test dependency in `producer/`, `spark/`, or `dashboard/` requirements. |
 
 ## Log
@@ -1679,3 +1680,103 @@ Also fixed two stale spots in `.env.example` that predate this work: the backfil
 split still read 3,375/2,538 where the README correctly says 3,435/2,594 after
 ticket 0010, and an orphaned `# Spark — Gemini analyst stage` header left over
 from the provider-chain rewrite.
+
+### 2026-09-01 — A crosshair on the share-price chart, and a gap-free time axis (Vilan)
+
+**What was missing.** The share-price chart is drawn against a real time axis and
+carries up to a year of daily closes, none of them labelled — the seven KPI charts
+each have five bars carrying their own value, this one had a line and nothing
+else. Reading a specific day off it meant hovering within a few pixels of the
+line, because Plotly's default `hovermode="closest"` only answers near the mark
+itself. On a line that wanders across the height of the panel that is chasing a
+moving target.
+
+**The crosshair** — `dashboard/charts.py`, inside `price_chart()`:
+
+- `hovermode="x unified"` with `hoverdistance=-1` and `spikedistance=-1`. The
+  unbounded distance is what makes it feel pinned: the cursor anywhere in the plot
+  area, including the top corner far above the line, reads the nearest trading
+  day. The readout is one box — the date as its header, the close beneath it.
+- A vertical spike: `spikemode="across"`, dotted, in the module's existing `MUTED`
+  grey so it reads as chrome rather than as a data mark.
+- `spikesnap="hovered data"`, so the rule lands on the bar being reported rather
+  than on the raw cursor x. It steps from one trading day to the next instead of
+  sliding, and never stands between two closes.
+- The trace's `hovertemplate` dropped its `%{x|%d %b %Y}` prefix, because the
+  unified box now supplies the date as a header; the format moved to the axis's
+  `hoverformat` (`%a %d %b %Y`, so the weekday shows).
+
+**The gap-free axis.** Non-trading days are now collapsed out of the axis by
+calling `woodies_chart._hide_gaps` — the same routine the sub-panels use, not a
+second copy of the arithmetic.
+
+Sharing it is the point rather than a shortcut. `app.py` builds the Woodies panel
+from this view's own dates (`prepare_frames(_bars, view.data["date"])`), so the
+two charts are stacked showing the same days under the same window selector. With
+only one of them collapsing its gaps, a date sat at a different horizontal
+position in each, and dropping your eye from a price move to that day's CCI or
+MACD reading landed on the wrong bar. Verified they now hide an identical set of
+slots on all five windows: 2 / 8 / 29 / 57 / 114 for 1W / 1M / 3M / 6M / 1Y.
+
+This is not a breach of the module's "a gap in the data is drawn as a gap" rule.
+That rule is about a fact a company did not report, where the empty space carries
+the meaning. A weekend is not a missing observation, it is time in which no
+observation can exist, and a flat segment across it invents two days of unchanged
+price that were never traded.
+
+**The trap in the middle of it,** which `bars_frame` already documents and which
+this hit head-on: `ts` on these bars is midnight *Eastern* expressed in UTC, so it
+lands at 04:00 under EDT and 05:00 under EST — 166 and 85 bars on a one-year AAPL
+window. `_hide_gaps` lays a uniform one-day grid from the first bar's clock time,
+so passing the raw dates hid every bar on the far side of the DST switch as a
+"gap": 251 trading days rendered as 52, and the first attempt did exactly that.
+The fix is the same normalisation `bars_frame` applies — truncate to the calendar
+date before drawing or collapsing. Guarded by a check across all 10 tickers x 5
+windows that no drawn bar appears in the hidden set.
+
+**Verified 2026-09-01** in Chrome against the real snapshot, exported to a
+standalone HTML figure (`write_html` on the same figure `app.py` renders, so no
+Docker or Elasticsearch; Chrome will not open `file://`, so the folder is served
+over `http.server` first):
+
+- 1W AAPL: the axis runs Mon 27 - Fri 31 Jul and then straight to Mon 3 Aug, with
+  no weekend. Every one of the six trading days was hovered individually and read
+  back its own date and close.
+- 1Y AAPL: swept in 1px steps across late December. Each day owns a contiguous
+  2-3px band — 24 Dec, then 26 Dec, then 29 Dec, with 25 Dec correctly absent.
+  Before the collapse the weekday spacing was ~1.67px with 5px jumps at weekends,
+  and a 3px mouse movement could skip a day outright.
+- The readout works from the top edge of the panel, far above the line, on both
+  windows, and the direction colour still holds (1Y blue at +51.2%, 1W red at
+  -9.1%).
+- All four offline dashboard checks pass on this branch: `verify_kpis.py`,
+  `verify_ai.py` and `verify_indicators.py` (10/10, 0 failing) exit 0, and the
+  figures-build check prints 70.
+
+**`woodies_chart.py` was not modified.** Its cursor spike stays as Dor wrote it —
+solid black, `hovermode="x"`, `spikesnap="cursor"` — so the two crosshairs still
+differ in look and in behaviour. Aligning them is a conversation with him, not a
+commit; raised here as an open consistency question. The one dependency added is
+`charts.py` importing `woodies_chart._hide_gaps`, which reaches across a private
+name — worth promoting to a public helper, or to a small shared module, whenever
+that file is next touched.
+
+**Found while doing this, not fixed:** the Woodies panel silently drops the
+**oldest bar of every window**. `prepare_frames` locates the window with
+`ts.searchsorted(lo, side="left")`, where `ts` is normalised to midnight but `lo`
+comes from `view.data["date"]` at 04:00/05:00, so the first day sorts before the
+window and falls out. Reproduces on every ticker and window checked: 1Y shows 250
+bars from 05 Aug 2025 where the price chart shows 251 from 04 Aug. One line to fix
+(normalise `vis` in `prepare_frames`), but it is Dor's file and his call.
+
+**README:** the crosshair sentence above the Woodies paragraph now also states
+that non-trading days are collapsed on the same grid as the panel below. Nothing
+else moved — no service, port, index or `.env` variable. `.gitignore` needed no
+edit: the change generates nothing, and the HTML used for the visual check is
+written outside the repo.
+
+**Also corrected:** the `verify_kpis.py` row in "How to test" still claimed
+`7/7 for 8 tickers` and named only AMZN and BRK.B as the exceptions. META has had
+no `shares_outstanding` since the buyback work on 2026-08-11 and reports 6/7; the
+row now matches what the command actually prints, so a teammate running it does
+not read a correct result as a failure.
