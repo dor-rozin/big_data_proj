@@ -16,7 +16,7 @@ status changes.
 | [0005](0005-yfinance-snapshot.md) | yfinance snapshot to disk | todo | 0001 |
 | [0006](0006-edgar-snapshot.md) | EDGAR XBRL snapshot to disk | todo | 0001, 0005 |
 | [0007](0007-replay-producer.md) | Replay producer (snapshot → Kafka) | in-progress | 0003–0006 |
-| [0008](0008-live-producer-finnhub-websocket.md) | Live producer — Finnhub WebSocket | todo | 0001, 0003, 0004, 0007 |
+| [0008](0008-live-producer-finnhub-websocket.md) | Live producer — Finnhub WebSocket | in-progress | 0001, 0003, 0004, 0007 |
 | [0009](0009-readme-and-demo-runbook.md) | README + demo runbook + cold-start check | todo | 0002–0004, 0007 |
 | [0010](0010-filing-text-producer.md) | Filing text — 8-K press releases → `sec.text.v1` | in-progress | 0001, 0003, 0006 |
 | [0011](0011-dagster-orchestration.md) | Dagster orchestration for the interval Spark run (stretch) | todo | 0007, 0009 |
@@ -86,6 +86,18 @@ honored. `producer/produce.py` (not a new `producers/text_producer.py`) merges
 prices and filings, keyed by `cik`, same pattern as the filings path. Not yet
 verified against a live broker end to end; the SEC round-trip acceptance
 criterion (`®` and typographic quotes surviving Kafka) is untested.
+
+**0008 moved to `in-progress` (2026-09-01), deliberately scoped down for the
+one-week demo deadline.** `producer/live_producer.py` (a single file, not a
+`producers/` package) does trade→bar aggregation, exponential-backoff
+reconnect, Ctrl-C flush, the `FINNHUB_API_KEY`/50-symbol guardrails, and
+crypto-symbol market-hours independence — verified offline against hand-built
+trade sequences and the frozen schema, no live broker or real key yet. The
+ticket's `10s`/`30s` schema widening was explicitly not done (frozen contract,
+needs the team); bar interval is pinned to the existing `1m/5m/1h/1d` enum
+instead. No `tests/` fixture suite, `docs/DEMO.md`, or `versions.md` updates —
+out of scope for the MVP. See the 2026-09-01 entry in
+[so_far.md](../so_far.md) for the full account.
 
 ## What's up next
 

@@ -1,7 +1,7 @@
 ---
 id: 0008
 title: Live producer — Finnhub WebSocket trades aggregated into bars
-status: todo
+status: in-progress
 layer: producers
 priority: P2
 depends_on: [0001, 0003, 0004, 0007]
