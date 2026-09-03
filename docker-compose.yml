@@ -314,6 +314,11 @@ services:
       # Docker-out-of-Docker: talk to the HOST's daemon to launch the spark job
       # as a sibling container, not a container nested inside this one.
       - /var/run/docker.sock:/var/run/docker.sock
+      # The Spark analyst's prompt, read-only. Mounted rather than copied into
+      # the image so there is ONE copy of it: the dashboard's second panel asks
+      # the same question over the same stage-3 context the Spark job would
+      # have used, and a duplicated prompt would drift from it silently.
+      - ./spark/prompts:/app/spark_prompts:ro
       # Mounted at the SAME absolute path as on the host so that when the
       # button below runs `docker compose` from this path, the host daemon
       # resolves docker-compose.yml's relative volume mounts (./historical_data

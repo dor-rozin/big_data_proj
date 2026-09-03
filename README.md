@@ -2,17 +2,21 @@
 
 End-to-end big data pipeline for the course project.
 
-**Pipeline:** `snapshot files → Kafka → Spark (transform + MLlib anomalies) → LLM analyst → Elasticsearch → Streamlit`
+**Pipeline:** `snapshot files → Kafka → Spark (transform + MLlib anomalies) → Elasticsearch → Streamlit (two LLM analysts, on demand)`
 
 - **Data (semi-structured + unstructured):** daily OHLCV price bars from yfinance *and* SEC filings from EDGAR — both the numeric facts and the narrative text — captured once into `historical_data/` and replayed into Kafka in two passes: a year of history bulk-loaded up front, then the following year streamed in slowly as simulated live traffic. Replaying a snapshot rather than fetching live means the demo works with no internet and produces identical bytes every run.
 - **Course technologies:** Docker, Apache Kafka (KRaft mode), Apache Spark, Elasticsearch, Streamlit.
-- **AI capability — two stages that depend on each other:** Spark MLlib **KMeans** flags trading days that sit far from an instrument's own normal behaviour, and those flagged days are then handed to an **LLM** (Groq or Gemini, switchable), which writes an analyst note and a buy/hold/sell recommendation. The model finds *where to look*; the LLM says *what it means*.
+- **AI capability — two stages that depend on each other:** Spark MLlib **KMeans** flags trading days that sit far from an instrument's own normal behaviour, and those flagged days are handed to an **LLM** (Groq or Gemini, switchable) that writes an analyst note and a buy/hold/sell recommendation. The model finds *where to look*; the LLM says *what it means*. The LLM runs **on demand from the dashboard**, not inside the batch job — see [Where the analyst runs](#where-the-analyst-runs).
 - **Insight:** which days each stock behaved abnormally, how those days line up with its filings, and what a careful reader would conclude from the two together.
 
-The infrastructure runs entirely locally in Docker. The analyst stage calls a
-hosted LLM, which needs a **free API key** — Groq or Gemini, switched with one
-line of config. See [The AI capability](#the-ai-capability-explained). Set
-`LLM_ENABLED=false` to run everything else without a key at all.
+The infrastructure runs entirely locally in Docker. The analyst calls a hosted
+LLM, which needs a **free API key** — Groq or Gemini, switched with one line of
+config. See [The AI capability](#the-ai-capability-explained). Set
+`LLM_ENABLED=false` to run everything without a key at all; every chart still
+works and only the two analyst panels go quiet.
+
+**A full run from a cold start takes about 90 seconds**, then roughly 3 seconds
+each time someone asks an analyst a question.
 
 ## Architecture
 
@@ -70,46 +74,120 @@ line of config. See [The AI capability](#the-ai-capability-explained). Set
 **First time on this machine:** `.env` is gitignored, so it does not come down
 from git — create it and add your own free API key **before** running anything.
 [RUNBOOK.md](RUNBOOK.md#first-time-on-this-machine--do-this-before-anything-else)
-walks through it; the short version is step 1 below.
+walks through it; the short version is step 1.
+
+### Every command, in order
 
 ```bash
 # 1. Create your local config, then paste in your own free API key.
-#    Groq (recommended):   https://console.groq.com/keys      -> GROQ_API_KEY=gsk_...
-#    Gemini (optional fallback): https://aistudio.google.com/apikey -> GEMINI_API_KEY=...
+#    Groq (primary):    https://console.groq.com/keys       -> GROQ_API_KEY=gsk_...
+#    Gemini (fallback): https://aistudio.google.com/apikey  -> GEMINI_API_KEY=...
 #
 #    Get YOUR OWN key rather than reusing a teammate's — the free budgets are
-#    metered per key. No key at all is fine too: stage 4 skips itself and
-#    everything except stock_analysis is still produced.
+#    metered per key. No key at all is fine: every chart still works and only
+#    the two analyst panels go quiet.
 cp .env.example .env
 
-# 2. Start the stack. This brings up Kafka, Elasticsearch, kafka-ui and the
-#    dashboard, and runs `topic-init` to create the three topics.
+# 2. Start the stack: Kafka, Elasticsearch, kafka-ui, the dashboard, and
+#    topic-init which creates the three topics. ~11s to healthy.
 docker compose up -d
-bash scripts/verify_stack.sh   # PASS/FAIL per service and per topic
+bash scripts/verify_stack.sh          # expect 8 PASS lines
 
-# 3. Backfill: load a year of history into Kafka in one go. Exits when done.
-docker compose run --rm producer
+# 3. Backfill a year of history into Kafka. Exits when done. ~3s.
+docker compose run --rm producer      # expect: delivered 3434, failed 0
 
-# 4. Live: stream the remaining year in slowly, as if it were arriving now.
+# 4. Spark: parse -> transform -> MLlib anomalies -> aggregate -> Elasticsearch.
+#    ~35s. Calls no LLM: the analysts run from the dashboard instead.
+docker compose --profile jobs run --rm spark
+
+# 5. Open http://localhost:8501 and click an analyst button. ~3s per answer.
+
+# When finished:
+docker compose down                   # stop, keep the data
+docker compose down -v                # stop and wipe Kafka + Elasticsearch
+```
+
+**Steps 2-4 take about 90 seconds from a cold start**, including a full
+`down -v` teardown first.
+
+### Optional extras
+
+```bash
+# Stream the remaining year in slowly, as if arriving now.
 docker compose --profile live up -d producer-live
 docker compose logs -f producer-live
 
-# 5. Run the Spark pipeline: transform + anomaly detection + LLM analyst +
-#    load into Elasticsearch. ~1 min on Groq. (First run also downloads the
-#    Kafka connector jar.)
-docker compose --profile jobs run --rm spark
+# Real live trades from Finnhub instead of the snapshot (needs FINNHUB_API_KEY).
+docker compose --profile live run --rm producer-live \
+    python -m producer.live_producer --symbols BINANCE:BTCUSDT --bar-interval 1m
 
-# 6. Open the dashboard at http://localhost:8501
-#    Analyst notes are written to ./llm_output/, and the exact prompts that
-#    were sent to ./llm_output/_prompts/
+# Pre-populate every company's note before a demo, instead of clicking each.
+# ~7 min: ten paced API calls. Off by default.
+docker compose --profile jobs run --rm -e SPARK_BATCH_ANALYST=true spark
 
-# When finished:
-docker compose down          # stop, keep data
-docker compose down -v       # stop and wipe Kafka/Elasticsearch data
+# One-command clean slate.
+bash scripts/reset_stack.sh           # wipe and restart, Kafka left empty
+bash scripts/reset_stack.sh --seed    # wipe, restart, and re-run the backfill
 ```
 
-`producer`, `producer-live`, and `spark` sit behind compose profiles, so
+`producer`, `producer-live` and `spark` sit behind compose profiles, so
 `docker compose up` never fires them implicitly.
+
+### Where to see everything
+
+| What | URL | Notes |
+|---|---|---|
+| **Dashboard** | **http://localhost:8501** | The demo. Charts, KPIs, both analysts |
+| **kafka-ui** | **http://localhost:8080** | Topics → pick one → Messages → **Seek Type: Oldest** |
+| **Elasticsearch** | **http://localhost:9200** | Needs a path — the bare root returns cluster metadata, not data |
+
+Useful Elasticsearch URLs, straight in a browser:
+
+| URL | Shows |
+|---|---|
+| http://localhost:9200/_cat/indices?v | All four indices with document counts |
+| http://localhost:9200/stock_prices/_search?pretty&size=5 | Price bars with anomaly flags |
+| http://localhost:9200/stock_prices/_search?pretty&q=is_anomaly:true&size=5 | Only the days MLlib flagged |
+| http://localhost:9200/stock_filings/_search?pretty&size=3 | 19 facts + 10 ratios per filing |
+| http://localhost:9200/stock_context/_search?pretty | Exactly what each analyst was shown |
+| http://localhost:9200/stock_analysis/_search?pretty | The notes produced so far |
+
+`?pretty` is what makes it readable. Two gotchas worth knowing:
+
+- **Use a dark-mode browser or select the text.** Elasticsearch returns raw
+  JSON with no stylesheet, and some browsers render it white-on-white. Nothing
+  is wrong with the data — `Cmd-A` proves it.
+- **`stock_context` reads 60 in `_cat/indices` but holds 10.** `top_anomalies`
+  is a `nested` field, so each anomaly counts as its own hidden Lucene document.
+  Use `/stock_context/_count` for the true number.
+
+Files on disk after a run:
+
+| Path | Contents |
+|---|---|
+| `llm_output/_prompts/TICKER.txt` | The exact prompt Spark assembled, written whether or not a model is ever called |
+
+### Checking it worked
+
+```bash
+# Kafka: expect 2500 / 876 / 58
+for t in market.prices.v1 sec.filings.v1 sec.text.v1; do
+  echo -n "$t: "
+  docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server localhost:9092 --topic $t | awk -F: '{s+=$3} END {print s+0}'
+done
+
+# Elasticsearch: expect 2500 / 876 / 10, and stock_analysis absent until a click
+for i in stock_prices stock_filings stock_context stock_analysis; do
+  echo -n "  $i: "
+  curl -s "localhost:9200/$i/_count" | python3 -c "import sys,json;print(json.load(sys.stdin)['count'])"
+done
+
+# All three services answering
+curl -s -o /dev/null -w "dashboard %{http_code}\n" http://localhost:8501
+curl -s -o /dev/null -w "kafka-ui  %{http_code}\n" http://localhost:8080
+curl -s -o /dev/null -w "elastic   %{http_code}\n" http://localhost:9200
+```
 
 ### Data persists across restarts — on purpose
 
@@ -142,8 +220,8 @@ first price bar plus `BACKFILL_DAYS` (365) — and each mode takes one side:
 | Seed history | `producer` | `--mode backfill` | before the split | `instant` |
 | Simulate live | `producer-live` | `--mode live` | at/after the split | `realtime`, over `REPLAY_DURATION` |
 
-With the current snapshot the split falls on **2025-09-03**: 3,435 events
-backfilled, 2,598 streamed live.
+With the current snapshot the split falls on **2025-09-03**: 3,434 events
+backfilled, 2,630 streamed live.
 
 This is one tool with a mode flag rather than two scripts for one reason: both
 sides read the *same* boundary out of `.env`, so they are provably
@@ -242,7 +320,7 @@ tested independently. The Spark half is split across small modules:
 | `spark/llm.py` | Gemini REST client: pacing, retries, response parsing |
 | `spark/es_writer.py` | Streamed, batched, idempotent Elasticsearch load |
 | `spark/prompts/analyst.md` | The analyst prompt — edit this, not the code |
-| `spark/pipeline.py` | Orchestrates the five stages |
+| `spark/pipeline.py` | Orchestrates the stages. Stage 4 is off by default — see [Where the analyst runs](#where-the-analyst-runs) |
 
 The dashboard half:
 
@@ -314,9 +392,9 @@ It defines three topics:
 | `sec.filings.v1` | 19 normalised financial facts per filing | numeric |
 | `sec.text.v1` | 8-K earnings press releases, plain text | **unstructured** |
 
-The text archive holds 1,347 press releases back to 2000, but the producer clips
+The text archive holds 1,348 press releases back to 2000, but the producer clips
 to those on or after the first price bar — a release with no price bar to join
-against is noise. 117 survive that clip on the current snapshot, 59 of them in
+against is noise. 118 survive that clip on the current snapshot, 58 of them in
 the backfill window.
 
 `sec.text.v1` is where the project's unstructured data comes from now that
@@ -375,7 +453,8 @@ the ones you are most likely to change:
 | `GROQ_MODEL`           | Model id (`llama-3.3-70b-versatile`)                                   |
 | `GEMINI_API_KEY`       | Free key from [AI Studio](https://aistudio.google.com/apikey). `.env` only |
 | `GEMINI_MODEL`         | Model id (`gemini-3.6-flash`)                                          |
-| `LLM_ENABLED`          | `false` skips the analyst stage entirely — no key needed               |
+| `LLM_ENABLED`          | Master switch. `false` silences **both** analysts — no key needed      |
+| `SPARK_BATCH_ANALYST`  | `true` makes the Spark job pre-populate every note (~7 min). Off by default |
 | `LLM_MIN_INTERVAL_SECONDS` | Seconds between API calls. Empty = per-provider default (1s groq, 13s gemini) |
 | `LLM_MAX_CALLS`        | Hard ceiling on API calls per run (50). Truncation is logged, never silent |
 | `ANALYSIS_INDEX`       | Elasticsearch index for the LLM output (`stock_analysis`)              |
@@ -409,11 +488,15 @@ numbers that produced it.
 
 ### 2. The LLM — saying *what it means*
 
-The pipeline then collapses everything to one row per `(ticker, interval)`:
-price summary, the top-5 anomalies with their dates and returns, how many
-anomalies landed within two days of a filing, the latest reported financials, and
-filing text where available. That row goes to the LLM with the prompt in
-[`spark/prompts/analyst.md`](spark/prompts/analyst.md), which returns a JSON
+Spark then collapses everything to one row per `(ticker, interval)`: price
+summary, the top-5 anomalies with their dates and returns, how many anomalies
+landed within two days of a filing, the latest reported financials, and filing
+text where available. That row is stored in `stock_context` **and the pipeline
+stops there.**
+
+When a reader clicks an analyst button, the dashboard reads that row, fills it
+into [`spark/prompts/analyst.md`](spark/prompts/analyst.md) at `{{DATA}}`, appends
+the reader's question if they typed one, and makes one call. Back comes a JSON
 recommendation (`buy`/`hold`/`sell`, confidence, risks, signals) plus a prose note.
 
 **Why the two stages need each other.** An LLM cannot scan thousands of price
@@ -423,8 +506,30 @@ company. KMeans does the scanning cheaply and deterministically, so the prompt
 names *specific unusual days with specific numbers*. That is the difference
 between a summariser and an analyst.
 
-**Aggregating first is what makes it affordable.** Ten instruments means ten API
-calls, not one per row.
+**Aggregating first is what makes it affordable.** One call per company a reader
+actually opens — not one per price bar, and not ten per pipeline run.
+
+### Where the analyst runs
+
+The LLM used to be stage 4 of the Spark job, calling once per instrument on
+every run. It now runs from the dashboard, when asked. What moved is only the
+API call: **stage 3b still assembles and stores the context**, so the evidence
+and the exact prompt are ready the moment Spark finishes.
+
+| | Batch, as it was | On demand, as it is |
+|---|---|---|
+| Spark run | ~7 min | **~35s** |
+| Calls per run | 10, whether anyone looks or not | 1, per company someone opens |
+| A rate limit | fails the pipeline stage | fails one button click |
+| `stock_analysis` | filled on every run | fills as the dashboard is used |
+
+Groq's free tier meters **tokens per minute** (8,000 measured), and a prompt
+carrying filing text costs ~3,260 tokens in and out — about 2.5 calls a minute.
+In batch that ceiling sat on the critical path and put a ten-instrument run past
+seven minutes. One call at a time has nothing to queue behind.
+
+`SPARK_BATCH_ANALYST=true` restores the old behaviour when you want every note
+pre-populated before a demo.
 
 ### Seeing what the analyst was given
 
@@ -437,7 +542,7 @@ The aggregate is not thrown away after the call. Stage 3b persists it two ways,
 | `llm_output/_prompts/TICKER.txt` | The exact prompt string, assembled by the same code path that sends it |
 
 Both cost no API quota, which is the point: iterate on
-[`spark/prompts/analyst.md`](spark/prompts/analyst.md) with `LLM_ENABLED=false`,
+[`spark/prompts/analyst.md`](spark/prompts/analyst.md) — Spark writes every prompt to disk without calling anything,
 inspect the assembled prompts, and spend the daily quota only on a prompt you
 have already checked.
 
@@ -459,16 +564,23 @@ note. Both answer "buy, hold or sell?" and both return the identical JSON
 contract, but they are grounded on different evidence and are allowed to
 disagree — a disagreement is a finding, not a bug.
 
-| | Spark's analyst | The dashboard's analyst |
-|---|---|---|
-| Code | `spark/llm.py`, stage 4 | `dashboard/ai_analyst.py` |
-| Prompt | `spark/prompts/analyst.md` | `dashboard/prompts/analyst_fundamentals.md` |
-| Grounded on | Price behaviour + the days KMeans flagged as unusual | The seven fundamentals metrics computed in `dashboard/kpis.py` |
-| Runs | In batch, once per pipeline run, for every instrument | Interactively, one company at a time, when a button is clicked |
-| Output | `stock_analysis` index + `llm_output/TICKER.md` | Rendered in the page; nothing is written back |
+Both panels live in the dashboard, one above the other:
 
-Both read `LLM_PROVIDER`, the matching key and `LLM_ENABLED`, so one switch moves
-or disables both. The dashboard's ignores `LLM_FALLBACK_PROVIDERS`: it makes a
+| | 🏠 Our Home Analyst | 🤖 AI Analyst |
+|---|---|---|
+| Prompt | `dashboard/prompts/analyst_fundamentals.md` | `spark/prompts/analyst.md` (mounted read-only, so it cannot drift from the batch path's copy) |
+| Grounded on | The seven fundamentals from `dashboard/kpis.py`, five fiscal years | Price behaviour, the days KMeans flagged, the latest filing facts, and the press-release text |
+| Runs | On a button click, one company | On a button click, one company |
+| Written to | `stock_analysis`, `source=home_analyst` | `stock_analysis`, `source=ai_analyst` |
+
+`source` is part of the document id (`ticker|interval|as_of|source`), so the two
+coexist rather than overwriting each other, and either can be queried alone.
+
+**Both are LLM-based.** They differ by evidence, not by one being "AI" and the
+other not — there is no rule-based recommendation anywhere in the project.
+
+Both read `LLM_PROVIDER`, the matching key and `LLM_ENABLED`, so one switch
+disables both. Neither uses `LLM_FALLBACK_PROVIDERS`: each makes a
 single call for a single company, so there is no mid-run point at which failing
 over would help.
 

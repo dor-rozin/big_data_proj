@@ -454,3 +454,59 @@ def analyse(evidence: dict, template: str | None = None,
     # An answer shown without the instruction that shaped it is not reproducible.
     result["focus_used"] = _clean_focus(focus)
     return result
+
+
+# ---------------------------------------------------------------------------
+# The second analyst: price behaviour and MLlib anomalies
+# ---------------------------------------------------------------------------
+# Same machinery, different evidence. This one reasons over the stage-3 context
+# the Spark job assembles -- price summary, the trading days MLlib's KMeans
+# flagged, the latest filing facts and the press-release excerpt -- rather than
+# over the seven fundamentals above. The two are allowed to disagree; that is
+# the point of running both.
+#
+# The prompt is Spark's own, mounted read-only at /app/spark_prompts rather than
+# copied here, so there is exactly one copy of it and the dashboard cannot drift
+# from what the batch job would have sent.
+ANOMALY_PROMPT_PATH = _env("ANOMALY_PROMPT_PATH",
+                           "/app/spark_prompts/analyst.md")
+
+
+def load_anomaly_prompt(path: str | None = None) -> str:
+    with open(path or ANOMALY_PROMPT_PATH, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def build_anomaly_prompt(context: dict, template: str | None = None,
+                         focus: str | None = "") -> str:
+    """Spark's analyst prompt, filled with the stage-3 context for one company.
+
+    `context` is the `stock_context` document. Its `context_json` field is the
+    exact blob the Spark job would have embedded, stored before any call was
+    made -- so what is sent here is byte-identical to the batch path's prompt,
+    plus the reader's emphasis if they gave one.
+    """
+    if not context:
+        raise AnalystUnavailable(
+            "No `stock_context` for this company yet. Run the Spark job first: "
+            "`docker compose --profile jobs run --rm spark`.")
+    blob = context.get("context_json")
+    if not blob:
+        raise AnalystUnavailable(
+            "The `stock_context` document carries no `context_json`.")
+
+    prompt = (template or load_anomaly_prompt()).replace("{{DATA}}", blob)
+    cleaned = _clean_focus(focus)
+    if cleaned:
+        prompt += FOCUS_SECTION.format(focus=cleaned)
+    return prompt
+
+
+def analyse_anomalies(context: dict, template: str | None = None,
+                      timeout: int = TIMEOUT_SECONDS,
+                      focus: str | None = "") -> dict:
+    """Build the anomaly prompt, make one call, return the parsed recommendation."""
+    result = call_model(build_anomaly_prompt(context, template, focus),
+                        timeout=timeout)
+    result["focus_used"] = _clean_focus(focus)
+    return result

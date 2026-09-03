@@ -13,8 +13,8 @@ To actually run the thing end to end with validation at every step, use
 | `producer/` — snapshot replay → Kafka | Amir | Runs end-to-end | Backfill + live modes both verified against a live broker: exact delivery counts, correct partitioning, headers intact. Now merges three sources (prices, filings, press-release text). Automated tests / `producers/` layout from ticket 0007 still outstanding |
 | `producer/live_producer.py` — Finnhub live trades → bars (ticket 0008 MVP) | Amir | Code written, not verified live | Built 2026-09-01: trade→bar aggregation, reconnect/backoff, Ctrl-C flush, crypto symbol mode for market-hours independence. Unit-verified offline (out-of-order trades, window-boundary correctness, schema validation, missing-key / 51-symbol guardrails) — no real Finnhub key or live broker run yet. Bar interval pinned to the existing `1m/5m/1h/1d` enum; the ticket's `10s`/`30s` schema widening deliberately deferred (frozen contract, needs the team). No `tests/` fixture suite or doc updates beyond a README section — full ticket scope (0008) not attempted, by design given the one-week deadline |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
-| `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
-| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart. Price chart gained a snapping vertical crosshair and a gap-collapsed time axis 2026-09-01. Sidebar "Refresh data" button added 2026-09-03 (Docker-out-of-Docker re-run of the Spark job from the browser) — verified live |
+| `spark/` — transform + KMeans + ES load | Dor | Runs end-to-end | Verified 2026-09-03 from a cold start: 82s total, 3,434 delivered, 130 anomalies, 3 indices. The LLM analyst moved out of this job to the dashboard; stage 3b still stores the context and prompts |
+| `dashboard/` — Streamlit | Ohad + Dor | Runs end-to-end | 7 KPI charts, candles + crosshair, Woodies CCI/Stoch/MACD sub-panels, and **two on-demand LLM analysts** writing back to `stock_analysis`. Demo-ready 2026-09-03 |
 | AI capability — dashboard-side analyst | Vilan | Code written, not verified | Built 2026-08-11: `dashboard/ai_analyst.py` + `prompts/analyst_fundamentals.md`, rendered by an AI panel in `app.py`. BUY/HOLD/SELL grounded on the 7 computed KPIs, separate from Spark's `stock_analysis`. Evidence and prompt verified offline for all 10 tickers, and one live Gemini call passed the contract — but **the panel has never rendered in a browser**, because that needs populated indices and no Spark run has happened on this machine yet |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
 | `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Joins `sec.filings.v1` by `cik` + `filed_date` window, **never** `accession_no` (0 shared accessions — contract corrected 2026-08-06, see log) |
@@ -40,6 +40,7 @@ add tests for an area; if an area has no row, there is nothing to run for it.
 | `scripts/create_topics.py` — drift detection | Manually set a topic's `retention.ms` (`docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type topics --entity-name <topic> --add-config retention.ms=604800000`), re-run `create_topics.py`, confirm it reports the drift and exits 0. |
 | `scripts/reset_stack.sh` | `bash scripts/reset_stack.sh --seed` — confirm the volumes are actually recreated (`docker volume ls` before/after) and the re-seed delivers the same 3,375/3,375 with 0 failed. |
 | `spark/` — full pipeline, no API key | `LLM_ENABLED=false docker compose --profile jobs run --rm spark` — runs stages 1, 2, 2b, 3 and 5. Needs a running stack with the backfill loaded; needs no Gemini key. |
+| `dashboard/` — the two analysts | Open http://localhost:8501, pick a company, click **Ask Our Home Analyst** then **Ask the AI Analyst**. Each should answer in ~3s and write one document: `curl -s "localhost:9200/stock_analysis/_search?pretty&q=ticker:NVDA"` must show two, with `source` `home_analyst` and `ai_analyst`. Neither panel may show anything before its button is pressed. |
 | `spark/` — full pipeline with the analyst | `docker compose --profile jobs run --rm spark` — as above plus the LLM stage. ~1 min on Groq. Expect 10 reports in `./llm_output/` and a spread of recommendations, not 10 identical ones. |
 | `spark/` — idempotency | Run the pipeline twice, then check the counts did not change: `curl -s localhost:9200/stock_prices/_count`. Deterministic `_id`s make the load an upsert, so a second run must leave 2,500 / 875 / 10, not double them. |
 | `spark/` — analyst context capture | `docker compose --profile jobs run --rm -e LLM_ENABLED=false spark` then `curl -s localhost:9200/stock_context/_count` — must be 10, and `ls llm_output/_prompts/` must hold 10 files. Costs no API quota; this is the check to run while iterating on the prompt. |
@@ -1907,3 +1908,83 @@ quick succession launches two concurrent `docker compose run` invocations.
 Harmless today (Spark's ES writes are idempotent upserts, so two concurrent
 runs just double the compute, not the data), but worth a `st.session_state`
 guard if this becomes a permanent feature rather than a demo aid.
+
+### 2026-09-03 — The LLM analyst moved out of Spark; the dashboard made demo-ready (Dor)
+
+**The pipeline no longer waits on an API.** Stage 4 — the batch LLM call, ten
+instruments per run — is off by default. Stage 3b is unchanged and still
+assembles the per-instrument context and writes it to `stock_context`, so the
+evidence and the exact prompt are ready the moment Spark finishes; only the HTTP
+call moved. A reader clicking a button in Streamlit now triggers it, for the one
+company they are looking at.
+
+**Measured, cold start to loaded, 2026-09-03: 82 seconds** (teardown 4s, stack up
+11s, verify 3s, producer 3s, Spark 34s, dashboard 6s), then ~3s per analyst
+click. The batch version of the same run took 7.5 minutes.
+
+Why it was slow: Groq's free tier meters **tokens per minute** (8,000 measured),
+and a prompt carrying filing text costs ~3,260 tokens in and out — about 2.5
+calls a minute. In batch that ceiling sat on the critical path. One call at a
+time has nothing to queue behind.
+
+**Two things had to change to make it work, both found by testing rather than
+by reading:**
+
+- *`LLM_ENABLED` is shared with the dashboard analyst.* Ohad wired it that way
+  deliberately, so using it to switch off the batch stage **also silenced the
+  on-demand analyst** — the exact path replacing it. Split into `LLM_ENABLED`
+  (master, still shared, default true) and `SPARK_BATCH_ANALYST` (this job only,
+  default false).
+- *The dashboard never wrote anything back.* `es_client` was read-only, so an
+  on-demand note lived in one browser session and `stock_analysis` stayed empty.
+  Added `write_analysis()`, keyed as the Spark writer keys its own.
+
+**Groq withdrew `llama-3.3-70b-versatile`** — the whole Llama family — so every
+call returned HTTP 404 `model_not_found` mid-project. Default is now
+`openai/gpt-oss-120b`, measured as having identical free-tier limits to every
+other model in the current lineup. Pacing moved 1s → 17s to match the current
+tier, and `PARSE_ATTEMPTS` now retries the *same* provider when the transport
+succeeded but the reply broke the JSON contract — a stochastic model failure,
+not a sick provider, and falling through spent the fallback's budget on
+something the first model would have fixed for free.
+
+**A second analyst, and the naming.** The panel that used to display Spark's
+batch note was showing the note the *other* panel had just written — two
+"different analysts" rendering identical text. It is now a real on-demand
+analyst using Spark's own prompt (mounted read-only from `spark/prompts/` rather
+than copied, so it cannot drift) filled with the `stock_context` blob.
+
+    🏠 Our Home Analyst   seven fundamentals, five fiscal years
+    🤖 AI Analyst         price behaviour, MLlib's flagged days, filing facts, press-release text
+
+`source` is now part of the `stock_analysis` document id
+(`ticker|interval|as_of|source`) so the two coexist instead of overwriting each
+other. **Both are LLM-based** — they differ by evidence, not by one being "AI"
+and the other not. There is no rule-based recommendation anywhere in the project,
+and saying otherwise in the presentation would not survive someone opening
+`ai_analyst.py`.
+
+**Demo-ready pass on the dashboard:** removed the provenance captions ("every
+value read from…", "Source: `revenue` · `net_income`", the missing-data
+expanders, "Computed facts — no model involved", "Provider `groq` · model… ·
+enriched with the MLlib anomaly summary", the educational-use footer). The AI
+Analyst panel no longer advertises itself as anomaly-focused — it is just a
+header, an input and a button, and the note it produces says what it considered.
+Neither panel renders anything before its button is pressed; a saved note from an
+earlier run used to appear at page load, which in a demo is indistinguishable
+from a live answer.
+
+**Fixed: analyst prose rendered as garbled LaTeX.** `st.markdown()` treats
+`$...$` as inline maths, so "revenue climbed from $16.7 B in 2021 to $130.5 B in
+2025" had its middle swallowed into an equation and the figures vanished. An
+`md()` helper escapes `$` before any model-written text is rendered, in both
+panels, summaries and bullet lists alike.
+
+**Verified end to end 2026-09-03:** 8/8 stack checks, 3,434 delivered / 0 failed,
+2,500 · 876 · 58 on the topics, 130 anomalies (13 per instrument), 10 contexts,
+three services answering 200, and both analysts producing and persisting a note
+with distinct ids.
+
+**Known, and deliberate:** Elasticsearch returns raw JSON with no stylesheet, so
+some browsers render it white-on-white. Nothing is wrong with the data — use a
+dark-mode browser, select the text, or add Kibana.

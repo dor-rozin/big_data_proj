@@ -93,22 +93,33 @@ LLM_FALLBACKS = [p.strip().lower()
 GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.6-flash")
 GROQ_API_KEY = _env("GROQ_API_KEY", "")
-GROQ_MODEL = _env("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = _env("GROQ_MODEL", "openai/gpt-oss-120b")
 OLLAMA_MODEL = _env("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_URL = _env("OLLAMA_URL", "http://ollama:11434")
 
 # Per-provider key, model, pacing and timeout.
 #
 # Pacing differs because the constraints differ: Gemini's free tier is ~5
-# requests/minute, Groq's is generous per-minute but capped on daily tokens, and
-# Ollama is a local container with no limit at all. The timeouts differ for the
-# same reason — 90s means "dead" for a hosted API and "still thinking" for
-# CPU-bound local inference, which on this hardware takes 30-60s per call.
+# requests/minute, Groq's meters tokens per minute, and Ollama is a local
+# container with no limit at all. The timeouts differ for the same reason — 90s
+# means "dead" for a hosted API and "still thinking" for CPU-bound local
+# inference, which on this hardware takes 30-60s per call.
 _PROVIDER_DEFAULTS = {
     "gemini": {"api_key": GEMINI_API_KEY, "model": GEMINI_MODEL,
                "min_interval": 13.0, "timeout": 90},
+    # 17s, derived rather than guessed. Groq's free tier meters TOKENS PER
+    # MINUTE (8,000, measured 2026-09-03). A prompt is ~2,660 tokens in and ~600
+    # out at LLM_MAX_TEXT_CHARS=6000, so ~3,260 per call; 8,000/3,260 is ~2.5
+    # calls a minute, and 17s is the floor that keeps a *batch* run inside that.
+    #
+    # Only the batch path needs this. One call fired from the dashboard has
+    # nothing to pace against, so the interval costs it nothing.
+    #
+    # (The previous default of 1s was calibrated against llama-3.3-70b's
+    # 12,000/min. Groq withdrew that model entirely on 2026-09-03 and every call
+    # began returning HTTP 404 model_not_found.)
     "groq": {"api_key": GROQ_API_KEY, "model": GROQ_MODEL,
-             "min_interval": 1.0, "timeout": 90},
+             "min_interval": 17.0, "timeout": 90},
     "ollama": {"api_key": "", "model": OLLAMA_MODEL,
                "min_interval": 0.0, "timeout": 600, "base_url": OLLAMA_URL},
 }
@@ -133,6 +144,17 @@ def _build_chain():
 LLM_CHAIN = _build_chain()
 _default_interval = LLM_CHAIN[0]["min_interval"] if LLM_CHAIN else 1.0
 LLM_ENABLED = _env("LLM_ENABLED", "true").lower() not in {"false", "0", "no"}
+
+# Whether THIS job calls the model, separate from whether any model may be
+# called at all. `LLM_ENABLED` is shared with the dashboard analyst
+# (dashboard/ai_analyst.py reads the same variable), so it cannot double as the
+# batch switch: turning the batch stage off with it would silently disable the
+# on-demand analyst too, which is the path that replaced it.
+#
+# Default false. Stage 3b still runs, so `stock_context` and the assembled
+# prompts are written either way and the dashboard has everything it needs.
+SPARK_BATCH_ANALYST = _env("SPARK_BATCH_ANALYST", "false").lower() \
+    not in {"false", "0", "no"}
 LLM_CONCURRENCY = _int("LLM_CONCURRENCY", 1)
 LLM_MIN_INTERVAL = _float("LLM_MIN_INTERVAL_SECONDS", _default_interval)
 LLM_MAX_CALLS = _int("LLM_MAX_CALLS", 50)
@@ -228,9 +250,16 @@ def main():
     if not rows:
         print("[llm] no context rows - skipping")
     elif not LLM_ENABLED:
-        print("[llm] LLM_ENABLED=false - skipping the API call.\n"
-              f"      The prompts that would have been sent are in "
-              f"{LLM_OUTPUT_DIR}/_prompts/")
+        print("[llm] LLM_ENABLED=false - no model will be called anywhere,\n"
+              "      including from the dashboard.\n"
+              f"      The assembled prompts are in {LLM_OUTPUT_DIR}/_prompts/")
+    elif not SPARK_BATCH_ANALYST:
+        print("[llm] SPARK_BATCH_ANALYST=false - the dashboard is the normal path for\n"
+              "      this stage; it calls the model when a reader asks and\n"
+              "      writes the result back to the same index.\n"
+              f"      The assembled prompts are in {LLM_OUTPUT_DIR}/_prompts/\n"
+              f"      and the evidence in the '{CONTEXT_INDEX}' index.\n"
+              "      Set LLM_ENABLED=true to pre-populate every company.")
     elif not LLM_CHAIN:
         print("[llm] no usable provider configured - skipping")
     elif not any(p.get("api_key") or p["name"] == "ollama" for p in LLM_CHAIN):
