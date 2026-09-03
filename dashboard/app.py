@@ -31,6 +31,7 @@ the business and a gap is a claim about the filing.
 """
 import hashlib
 import os
+import subprocess
 
 import pandas as pd
 import streamlit as st
@@ -46,6 +47,37 @@ st.set_page_config(page_title="Financial KPIs & AI Analyst",
                    page_icon="📊", layout="wide")
 
 FISCAL_YEARS = int(os.getenv("DASHBOARD_YEARS") or 5)
+
+# Set by docker-compose.yml so the "Refresh data" button below can run
+# `docker compose` from the SAME absolute path as a host terminal would --
+# see the comment on the dashboard service's volumes for why this matters.
+PROJECT_DIR = os.getenv("PROJECT_DIR")
+
+
+def run_spark_refresh() -> tuple[bool, str]:
+    """Re-run the Spark batch job (Kafka -> Elasticsearch) via the host's Docker
+    daemon, Docker-out-of-Docker: this container mounts /var/run/docker.sock,
+    so `docker compose` here launches a sibling container, not a nested one.
+
+    Spark does a full reprocess each run (no offset tracking, see RUNBOOK), so
+    this always picks up everything currently on the Kafka topics -- whatever
+    the replay/live producers have sent since the stack came up.
+    """
+    if not PROJECT_DIR:
+        return False, ("PROJECT_DIR is not set. This button only works when the "
+                        "dashboard is run via `docker compose up`, not a bare "
+                        "`streamlit run app.py`.")
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "--profile", "jobs", "run", "--rm", "spark"],
+            cwd=PROJECT_DIR, capture_output=True, text=True, timeout=300,
+        )
+    except FileNotFoundError:
+        return False, "docker CLI not found in this container."
+    except subprocess.TimeoutExpired:
+        return False, "Spark job did not finish within 300s."
+    output = result.stdout + result.stderr
+    return result.returncode == 0, output
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +140,22 @@ for name, count in status.items():
         st.sidebar.markdown(f"- `{name}` — **missing**")
     else:
         st.sidebar.markdown(f"- `{name}` — {count:,} docs")
+
+if st.sidebar.button("🔄 Refresh data", use_container_width=True,
+                     help="Re-run the Spark job so Elasticsearch (and this "
+                          "page) picks up everything currently on the Kafka "
+                          "topics -- new bars from the live producer, a new "
+                          "day's filings, etc."):
+    with st.sidebar.status("Running Spark job...", expanded=False) as status_box:
+        ok, log = run_spark_refresh()
+        if ok:
+            status_box.update(label="Done — data refreshed", state="complete")
+        else:
+            status_box.update(label="Spark job failed", state="error")
+            st.sidebar.code(log[-2000:] or "no output", language=None)
+    if ok:
+        st.cache_data.clear()
+        st.rerun()
 
 tickers = load_tickers()
 if not tickers:

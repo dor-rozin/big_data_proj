@@ -297,6 +297,13 @@ services:
       elasticsearch:
         condition: service_healthy
     env_file: .env
+    environment:
+      # Absolute host path to this repo, so the "Refresh data" button's
+      # `docker compose` call (see PROJECT_DIR in app.py) resolves the SAME
+      # relative volume paths (./historical_data, .env, ...) that a host
+      # terminal would -- it's talking to the host daemon over the socket
+      # below, not a nested Docker.
+      - PROJECT_DIR=${PWD}
     ports:
       - "8501:8501"
     volumes:
@@ -304,6 +311,14 @@ services:
       # without a `docker compose build`. The image still COPYs the same code in,
       # so the container remains self-contained if this mount is removed.
       - ./dashboard:/app
+      # Docker-out-of-Docker: talk to the HOST's daemon to launch the spark job
+      # as a sibling container, not a container nested inside this one.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mounted at the SAME absolute path as on the host so that when the
+      # button below runs `docker compose` from this path, the host daemon
+      # resolves docker-compose.yml's relative volume mounts (./historical_data
+      # etc.) against the real host directory, not this container's view of it.
+      - ${PWD}:${PWD}
 
 networks:
   # One explicit user-defined bridge, so service names resolve predictably and

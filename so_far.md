@@ -14,7 +14,7 @@ To actually run the thing end to end with validation at every step, use
 | `producer/live_producer.py` — Finnhub live trades → bars (ticket 0008 MVP) | Amir | Code written, not verified live | Built 2026-09-01: trade→bar aggregation, reconnect/backoff, Ctrl-C flush, crypto symbol mode for market-hours independence. Unit-verified offline (out-of-order trades, window-boundary correctness, schema validation, missing-key / 51-symbol guardrails) — no real Finnhub key or live broker run yet. Bar interval pinned to the existing `1m/5m/1h/1d` enum; the ticket's `10s`/`30s` schema widening deliberately deferred (frozen contract, needs the team). No `tests/` fixture suite or doc updates beyond a README section — full ticket scope (0008) not attempted, by design given the one-week deadline |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
 | `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
-| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart. Price chart gained a snapping vertical crosshair and a gap-collapsed time axis 2026-09-01 |
+| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart. Price chart gained a snapping vertical crosshair and a gap-collapsed time axis 2026-09-01. Sidebar "Refresh data" button added 2026-09-03 (Docker-out-of-Docker re-run of the Spark job from the browser) — verified live |
 | AI capability — dashboard-side analyst | Vilan | Code written, not verified | Built 2026-08-11: `dashboard/ai_analyst.py` + `prompts/analyst_fundamentals.md`, rendered by an AI panel in `app.py`. BUY/HOLD/SELL grounded on the 7 computed KPIs, separate from Spark's `stock_analysis`. Evidence and prompt verified offline for all 10 tickers, and one live Gemini call passed the contract — but **the panel has never rendered in a browser**, because that needs populated indices and no Spark run has happened on this machine yet |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
 | `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Joins `sec.filings.v1` by `cik` + `filed_date` window, **never** `accession_no` (0 shared accessions — contract corrected 2026-08-06, see log) |
@@ -1847,3 +1847,63 @@ someone with a key needs to run both symbol modes at least once against a live
 broker and confirm bars actually land on `market.prices.v1` — the WebSocket
 plumbing itself (`websocket-client`, added to `producer/requirements.txt`) is
 untested beyond import.
+
+### 2026-09-03 — A "Refresh data" button in the dashboard sidebar (Amir)
+
+**What prompted it.** Demo rehearsal exposed a real gap: `producer-live`
+streams continuously into Kafka, but `spark/pipeline.py` is a one-shot batch
+read (`spark.read`, not `spark.readStream` — confirmed by grep, nothing in
+this codebase uses Structured Streaming), so nothing reaches Elasticsearch or
+the dashboard until someone manually re-runs the Spark job from a terminal.
+Converting the pipeline to genuine Structured Streaming was considered and
+rejected for this deadline: MLlib's `KMeans.fit()` needs a static DataFrame
+(the anomaly stage can't train on a live stream without splitting fit from
+score), and the LLM analyst stage would blow through Groq/Gemini's daily quota
+if triggered per micro-batch. A button that re-runs the existing batch job is
+the honest middle ground — it doesn't add streaming, it just removes the
+terminal round-trip.
+
+**How it works — Docker-out-of-Docker, not a nested Docker.** The dashboard
+container now mounts `/var/run/docker.sock` (confirmed to be a symlink to the
+real OrbStack socket on this machine, so the standard mount path works) and
+the repo bind-mounted at the *same absolute path* it lives at on the host
+(`${PWD}:${PWD}` in `docker-compose.yml`, with `PROJECT_DIR=${PWD}` passed as
+an env var so `app.py` knows where to `cwd` for the subprocess call). This
+matters because `docker compose`'s relative volume paths
+(`./historical_data:/snapshots:ro` etc.) are resolved by whichever daemon
+executes them against whatever directory the CLI was invoked from — since the
+socket points at the *host* daemon, running `docker compose` from inside this
+container only resolves those paths correctly if the container's view of the
+filesystem lines up byte-for-byte with the host's. Mounting the repo at an
+identical path is what makes that true; a mount to some other in-container
+path (e.g. `/app`) would have silently mounted the wrong directory in the new
+Spark container.
+
+`dashboard/Dockerfile` installs `docker-cli` + `docker-compose` (Debian
+trixie's own packages, 2.26.1 — confirmed *not* to need Docker's external apt
+repo, and confirmed to register as the `docker compose` subcommand, not the
+legacy hyphenated v1 binary, by test-building a throwaway container before
+touching the real Dockerfile). `app.py` gained a sidebar button that runs
+`docker compose --profile jobs run --rm spark` via `subprocess.run` inside an
+`st.status()` block, then `st.cache_data.clear()` + `st.rerun()` once it
+exits 0, so the whole page reflects new data immediately without a manual
+browser refresh.
+
+**Verified live**, in this order: test-installed `docker-cli`/`docker-compose`
+in a throwaway `python:3.11-slim` container first to confirm package
+availability and the `docker compose version` subcommand before writing the
+real Dockerfile change; rebuilt the dashboard image and confirmed from inside
+the running container that `docker version` reaches the host daemon and
+`$PROJECT_DIR/docker-compose.yml` resolves; ran the exact command manually
+inside the container to confirm the DooD path works end to end (full
+pipeline output, ES counts updated) *before* trusting the UI; then drove the
+actual button in a headless browser (Playwright) — confirmed the "RUNNING..."
+indicator, the `st.status` "Running Spark job..." box, and a clean return to
+normal state with no console errors, with no spark container left behind
+afterward (`--rm` cleans it up, confirmed via `docker ps -a`).
+
+**Known limitation, not fixed:** no debouncing — clicking the button twice in
+quick succession launches two concurrent `docker compose run` invocations.
+Harmless today (Spark's ES writes are idempotent upserts, so two concurrent
+runs just double the compute, not the data), but worth a `st.session_state`
+guard if this becomes a permanent feature rather than a demo aid.

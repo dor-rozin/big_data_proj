@@ -256,6 +256,23 @@ The dashboard half:
 | `dashboard/ai_analyst.py` | The fundamentals-based analyst (separate from the Spark one) |
 | `dashboard/app.py` | Wiring and layout only |
 
+### The "Refresh data" button
+
+The sidebar has a button that re-runs the Spark batch job
+(`docker compose --profile jobs run --rm spark`) without leaving the browser —
+useful when a live producer has been streaming and you want the dashboard to
+catch up without switching to a terminal. It works via Docker-out-of-Docker:
+the dashboard container mounts the host's `/var/run/docker.sock` and the repo
+at the same absolute path it lives at on the host (`${PWD}:${PWD}` in
+`docker-compose.yml`), so `docker compose` run from inside the container talks
+to the host daemon and launches Spark as a sibling container, resolving the
+same relative volume paths a host terminal would. Spark's own re-run is a full
+reprocess (no offset tracking), so the button always reflects everything
+currently on the Kafka topics — it does not fetch new external data itself, it
+syncs the batch layer to whatever the producer has already sent. Only works
+when the dashboard is started via `docker compose up` (needs the socket mount
+and `PROJECT_DIR` env var); a bare `streamlit run app.py` disables it.
+
 The share-price chart carries a vertical crosshair. It follows the cursor
 anywhere in the panel — not only along the line — and snaps to trading days,
 reading out that day's date and close. Weekends and market holidays are
