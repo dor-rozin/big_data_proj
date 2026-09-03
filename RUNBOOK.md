@@ -12,8 +12,8 @@ Expected end state:
 |---|---|---|---|---|
 | `market.prices.v1` | 2,500 | | `stock_prices` | 2,500 |
 | `sec.filings.v1` | 876 | | `stock_filings` | 876 |
-| `sec.text.v1` | 59 | | `stock_context` | 10 |
-| **backfill total** | **3,435** | | `stock_analysis` | 10 |
+| `sec.text.v1` | 58 | | `stock_context` | 10 |
+| **backfill total** | **3,434** | | `stock_analysis` | written on demand |
 
 ---
 
@@ -187,7 +187,7 @@ claiming anything downstream was created.
 docker compose run --rm producer
 ```
 
-**Expect:** `delivered : 3435`, `failed : 0`, about a second.
+**Expect:** `delivered : 3434`, `failed : 0`, about a second.
 
 **Validate the split:**
 
@@ -199,17 +199,17 @@ for t in market.prices.v1 sec.filings.v1 sec.text.v1; do
 done
 ```
 
-**Expect `2500`, `876` and `59`** — together the 3,435 delivered.
+**Expect `2500`, `876` and `58`** — together the 3,434 delivered.
 
 The producer also prints why the text count is small:
 
 ```
-text: 117 of 1,347 press releases ... land on or after the first price bar
+text: 118 of 1,348 press releases ... land on or after the first price bar
       (2024-09-03); the rest predate it and are skipped
 ```
 
 The archive goes back to 2000, but a press release with no price bar to join
-against is noise. 117 survive the clip; 59 of those fall in the backfill window
+against is noise. 118 survive the clip; 58 of those fall in the backfill window
 and the rest go to the live stream.
 
 **See a RAW message. This is the "before" half of the comparison in step 7:**
@@ -281,17 +281,21 @@ set `LLM_PROVIDER=gemini`, or `LLM_ENABLED=false` to skip the stage.
 
 | Stage | Line |
 |---|---|
-| 1 | `2500 messages parsed`, `876`, `59` |
-| 2 | `prices: 2500` · `filings: 876` · `text: 59` · `groups: 10` |
+| 1 | `2500 messages parsed`, `876`, `58` |
+| 2 | `prices: 2500` · `filings: 876` · `text: 58` · `groups: 10` |
 | 2b | `10 groups, 130 bars flagged at top 5% per group` |
 | 3 | `aggregated to 10 row(s)` |
 | 3b | `dumped 10 prompt(s)` |
-| 4 | `Stage 4 - LLM analyst (groq)`, then 10 results |
-| 5 | `2500` · `876` · `10` · `10` |
+| 4 | `SPARK_BATCH_ANALYST=false - the dashboard is the normal path` |
+| 5 | `2500` · `876` · `10` — `stock_analysis` is not written here |
 
-If the daily token budget is gone, stage 4 shows failures and stage 5 writes
-fewer than 10 analyses. Stages 1-3b and the other three indices are unaffected —
-that is the intended degradation, not a broken run.
+**Stage 4 is off by default.** The analysts run from the dashboard, one call per
+company someone opens, so the pipeline never waits on an API. Stage 3b still
+assembles and stores the context, so the evidence and the exact prompts are ready
+the moment Spark finishes.
+
+Set `-e SPARK_BATCH_ANALYST=true` to pre-populate every note before a demo —
+budget ~7 minutes for ten paced calls.
 
 **Two things that should look wrong if they appear:**
 
@@ -429,6 +433,39 @@ files are for reading; the indices are for querying and for the dashboard.
 
 ---
 
+## 8b · The dashboard — what a demo actually shows
+
+**http://localhost:8501**
+
+Pick a company in the sidebar, then top to bottom:
+
+| Section | What it is |
+|---|---|
+| Headline tiles | Revenue, net profit, diluted EPS, debt/equity — latest fiscal year vs the one before |
+| **Share price** | Daily candles with a crosshair that snaps to trading days. Window selector 1W-1Y |
+| **See more details** | Woodies CCI, Stochastic and MACD sub-panels, all nine periods adjustable |
+| Seven KPI charts | Revenue, net profit, EPS, debt/equity, cash flow, rule-of-40, buyback |
+| **🏠 Our Home Analyst** | Reasons over those seven metrics. Type a question, click, ~3s |
+| **🤖 AI Analyst** | Reasons over price behaviour, the days MLlib flagged, filing facts and press-release text. Same shape, different evidence |
+
+**Neither analyst shows anything until its button is pressed** — no stale note
+from an earlier run appears at page load, so what a demo audience sees was
+produced in front of them.
+
+The two are allowed to disagree. That is a finding, not a bug: they are given
+different evidence on purpose.
+
+**Both are LLM-based.** They differ by evidence, not by one being "AI" and the
+other not — worth being precise about if anyone asks.
+
+Verify it is serving:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8501     # 200
+```
+
+---
+
 ## 9 · Idempotency
 
 ```bash
@@ -466,10 +503,9 @@ curl -s "localhost:9200/stock_context/_search?pretty" -H 'Content-Type: applicat
   -d '{"_source":["ticker","filing_text_available","anomalies_near_filing"],"size":20}'
 ```
 
-**Running without an API key.** Nothing special is required — if no provider in
-the chain has a key, stage 4 skips itself and the run exits 0. Stages 1, 2, 2b, 3,
-3b and 5 all complete, and the prompts are still dumped so the context stays
-inspectable. `-e LLM_ENABLED=false` does the same thing explicitly.
+**Running without an API key.** Nothing special is required — the Spark job never
+calls a model anyway. Every chart in the dashboard works; only the two analyst
+buttons go quiet, saying so plainly. `LLM_ENABLED=false` silences them explicitly.
 
 **Each person needs their own key.** `.env` is gitignored, so a fresh clone has
 `.env.example` with the key fields empty. Free keys:
