@@ -11,8 +11,8 @@ Expected end state:
 | Kafka topic | messages | | Elasticsearch index | docs |
 |---|---|---|---|---|
 | `market.prices.v1` | 2,500 | | `stock_prices` | 2,500 |
-| `sec.filings.v1` | 875 | | `stock_filings` | 875 |
-| `sec.text.v1` | 60 | | `stock_context` | 10 |
+| `sec.filings.v1` | 876 | | `stock_filings` | 876 |
+| `sec.text.v1` | 59 | | `stock_context` | 10 |
 | **backfill total** | **3,435** | | `stock_analysis` | 10 |
 
 ---
@@ -199,17 +199,17 @@ for t in market.prices.v1 sec.filings.v1 sec.text.v1; do
 done
 ```
 
-**Expect `2500`, `875` and `60`** — together the 3,435 delivered.
+**Expect `2500`, `876` and `59`** — together the 3,435 delivered.
 
 The producer also prints why the text count is small:
 
 ```
-text: 116 of 1,324 press releases ... land on or after the first price bar
-      (2024-08-05); the rest predate it and are skipped
+text: 117 of 1,347 press releases ... land on or after the first price bar
+      (2024-09-03); the rest predate it and are skipped
 ```
 
 The archive goes back to 2000, but a press release with no price bar to join
-against is noise. 116 survive the clip; 60 of those fall in the backfill window
+against is noise. 117 survive the clip; 59 of those fall in the backfill window
 and the rest go to the live stream.
 
 **See a RAW message. This is the "before" half of the comparison in step 7:**
@@ -245,7 +245,7 @@ per-company ordering is guaranteed — not a bug.
 
 Earlier versions of this runbook hand-loaded a single sample message here,
 because `sec.text.v1` had no producer. **Ticket 0010 landed and it does now** —
-step 4 already delivered 60 press releases. Nothing to run.
+step 4 already delivered 59 press releases. Nothing to run.
 
 ## 6 · Spark pipeline
 
@@ -281,13 +281,13 @@ set `LLM_PROVIDER=gemini`, or `LLM_ENABLED=false` to skip the stage.
 
 | Stage | Line |
 |---|---|
-| 1 | `2500 messages parsed`, `875`, `60` |
-| 2 | `prices: 2500` · `filings: 875` · `text: 60` · `groups: 10` |
+| 1 | `2500 messages parsed`, `876`, `59` |
+| 2 | `prices: 2500` · `filings: 876` · `text: 59` · `groups: 10` |
 | 2b | `10 groups, 130 bars flagged at top 5% per group` |
 | 3 | `aggregated to 10 row(s)` |
 | 3b | `dumped 10 prompt(s)` |
 | 4 | `Stage 4 - LLM analyst (groq)`, then 10 results |
-| 5 | `2500` · `875` · `10` · `10` |
+| 5 | `2500` · `876` · `10` · `10` |
 
 If the daily token budget is gone, stage 4 shows failures and stage 5 writes
 fewer than 10 analyses. Stages 1-3b and the other three indices are unaffected —
@@ -351,7 +351,7 @@ done
 | Index | Docs | Contents |
 |---|---|---|
 | `stock_prices` | 2,500 | bars + derived columns + anomaly flags |
-| `stock_filings` | 875 | 19 facts + 10 ratios, restatements deduped |
+| `stock_filings` | 876 | 19 facts + 10 ratios, restatements deduped |
 | `stock_context` | 10 | exactly what the analyst was shown |
 | `stock_analysis` | 10 | recommendation, confidence, risks, signals, summary |
 
@@ -371,7 +371,7 @@ curl -s "localhost:9200/stock_analysis/_count" -H 'Content-Type: application/jso
 ```
 
 `stock_prices` and `stock_filings` are keyed on the data itself
-(`ticker|interval|ts`, `accession_no`), so they stay flat at 2,500 and 875 no
+(`ticker|interval|ts`, `accession_no`), so they stay flat at 2,500 and 876 no
 matter how many days you run.
 
 ### Use `_count`, not `_cat/indices`
@@ -439,7 +439,7 @@ for i in stock_prices stock_filings stock_context stock_analysis; do
 done
 ```
 
-**`stock_prices` and `stock_filings` must be unchanged** — 2,500 and 875, not
+**`stock_prices` and `stock_filings` must be unchanged** — 2,500 and 876, not
 doubled. `stock_context` and `stock_analysis` are unchanged too *within a day*;
 across a day boundary they gain one set each, by design (see above). Every document
 id is derived from its natural key (`ticker|interval|ts`, `accession_no`,

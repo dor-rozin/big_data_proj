@@ -142,8 +142,8 @@ first price bar plus `BACKFILL_DAYS` (365) — and each mode takes one side:
 | Seed history | `producer` | `--mode backfill` | before the split | `instant` |
 | Simulate live | `producer-live` | `--mode live` | at/after the split | `realtime`, over `REPLAY_DURATION` |
 
-With the current snapshot the split falls on **2025-08-05**: 3,435 events
-backfilled, 2,594 streamed live.
+With the current snapshot the split falls on **2025-09-03**: 3,435 events
+backfilled, 2,598 streamed live.
 
 This is one tool with a mode flag rather than two scripts for one reason: both
 sides read the *same* boundary out of `.env`, so they are provably
@@ -182,6 +182,29 @@ docker compose run --rm producer python produce.py --mode backfill --dry-run --v
 
 Every message is validated against `schemas/*.schema.json` before the first byte
 goes out; `--validate-all` checks all of them instead of one per topic.
+
+### A third, optional producer job: real live trades
+
+`producer/live_producer.py` is a separate, optional producer that replaces
+simulated "live" data with an actual Finnhub WebSocket trade feed, aggregated
+into OHLCV bars on the same `market.prices.v1` topic and schema — a consumer
+cannot tell it apart from `produce.py`'s output except by the `interval` field.
+It does not replace `producer-live` above; run either or both.
+
+```bash
+# Needs FINNHUB_API_KEY in .env (free key: https://finnhub.io/register).
+.venv/bin/python -m producer.live_producer --symbols AAPL,MSFT,NVDA --bar-interval 1m
+
+# Market-hours-independent: crypto trades continuously, so this is the mode to
+# lead with for a presentation outside 16:30-23:00 Israel time (US market hours).
+.venv/bin/python -m producer.live_producer --symbols BINANCE:BTCUSDT,BINANCE:ETHUSDT --bar-interval 1m
+```
+
+Bar width is currently pinned to the existing schema-valid intervals
+(`1m`/`5m`/`1h`/`1d`) — sub-minute bars would need a `market.prices.v1` schema
+change, which is a frozen contract and a whole-team conversation, not done here.
+Reconnects with exponential backoff and never exits on a dropped socket; Ctrl-C
+flushes the in-flight bar and exits cleanly.
 
 ### Checking that data landed
 
@@ -233,6 +256,23 @@ The dashboard half:
 | `dashboard/ai_analyst.py` | The fundamentals-based analyst (separate from the Spark one) |
 | `dashboard/app.py` | Wiring and layout only |
 
+### The "Refresh data" button
+
+The sidebar has a button that re-runs the Spark batch job
+(`docker compose --profile jobs run --rm spark`) without leaving the browser —
+useful when a live producer has been streaming and you want the dashboard to
+catch up without switching to a terminal. It works via Docker-out-of-Docker:
+the dashboard container mounts the host's `/var/run/docker.sock` and the repo
+at the same absolute path it lives at on the host (`${PWD}:${PWD}` in
+`docker-compose.yml`), so `docker compose` run from inside the container talks
+to the host daemon and launches Spark as a sibling container, resolving the
+same relative volume paths a host terminal would. Spark's own re-run is a full
+reprocess (no offset tracking), so the button always reflects everything
+currently on the Kafka topics — it does not fetch new external data itself, it
+syncs the batch layer to whatever the producer has already sent. Only works
+when the dashboard is started via `docker compose up` (needs the socket mount
+and `PROJECT_DIR` env var); a bare `streamlit run app.py` disables it.
+
 The share-price chart carries a vertical crosshair. It follows the cursor
 anywhere in the panel — not only along the line — and snaps to trading days,
 reading out that day's date and close. Weekends and market holidays are
@@ -274,9 +314,9 @@ It defines three topics:
 | `sec.filings.v1` | 19 normalised financial facts per filing | numeric |
 | `sec.text.v1` | 8-K earnings press releases, plain text | **unstructured** |
 
-The text archive holds 1,324 press releases back to 2000, but the producer clips
+The text archive holds 1,347 press releases back to 2000, but the producer clips
 to those on or after the first price bar — a release with no price bar to join
-against is noise. 116 survive that clip on the current snapshot, 60 of them in
+against is noise. 117 survive that clip on the current snapshot, 59 of them in
 the backfill window.
 
 `sec.text.v1` is where the project's unstructured data comes from now that

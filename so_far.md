@@ -11,9 +11,10 @@ To actually run the thing end to end with validation at every step, use
 | Area | Owner | Status | Notes |
 |---|---|---|---|
 | `producer/` — snapshot replay → Kafka | Amir | Runs end-to-end | Backfill + live modes both verified against a live broker: exact delivery counts, correct partitioning, headers intact. Now merges three sources (prices, filings, press-release text). Automated tests / `producers/` layout from ticket 0007 still outstanding |
+| `producer/live_producer.py` — Finnhub live trades → bars (ticket 0008 MVP) | Amir | Code written, not verified live | Built 2026-09-01: trade→bar aggregation, reconnect/backoff, Ctrl-C flush, crypto symbol mode for market-hours independence. Unit-verified offline (out-of-order trades, window-boundary correctness, schema validation, missing-key / 51-symbol guardrails) — no real Finnhub key or live broker run yet. Bar interval pinned to the existing `1m/5m/1h/1d` enum; the ticket's `10s`/`30s` schema widening deliberately deferred (frozen contract, needs the team). No `tests/` fixture suite or doc updates beyond a README section — full ticket scope (0008) not attempted, by design given the one-week deadline |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
 | `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
-| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart. Price chart gained a snapping vertical crosshair and a gap-collapsed time axis 2026-09-01 |
+| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart. Price chart gained a snapping vertical crosshair and a gap-collapsed time axis 2026-09-01. Sidebar "Refresh data" button added 2026-09-03 (Docker-out-of-Docker re-run of the Spark job from the browser) — verified live |
 | AI capability — dashboard-side analyst | Vilan | Code written, not verified | Built 2026-08-11: `dashboard/ai_analyst.py` + `prompts/analyst_fundamentals.md`, rendered by an AI panel in `app.py`. BUY/HOLD/SELL grounded on the 7 computed KPIs, separate from Spark's `stock_analysis`. Evidence and prompt verified offline for all 10 tickers, and one live Gemini call passed the contract — but **the panel has never rendered in a browser**, because that needs populated indices and no Spark run has happened on this machine yet |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
 | `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Joins `sec.filings.v1` by `cik` + `filed_date` window, **never** `accession_no` (0 shared accessions — contract corrected 2026-08-06, see log) |
@@ -31,8 +32,8 @@ add tests for an area; if an area has no row, there is nothing to run for it.
 |---|---|
 | `schemas/` — message contract | `.venv/bin/python scripts/validate_schemas.py` (see README for venv setup) |
 | `producer/` — contract conformance | `.venv/bin/python producer/produce.py --dry-run --validate-all` — loads all three snapshots, merges them, validates every message against its schema, sends nothing. Needs no broker. |
-| `producer/` — backfill/live split | `.venv/bin/python producer/produce.py --mode backfill --dry-run` then `--mode live --dry-run`. The two event counts must sum to the full timeline count (3,435 + 2,594 = 6,029 on the current snapshot). |
-| `producer/` — text window clipping | `.venv/bin/python producer/produce.py --dry-run` and read the `[producer] text` line — must read "116 of 1,324" (or whatever the current snapshot's counts are), never all 1,324. Confirms decades of pre-price-window press releases stay on disk and never reach Kafka. |
+| `producer/` — backfill/live split | `.venv/bin/python producer/produce.py --mode backfill --dry-run` then `--mode live --dry-run`. The two event counts must sum to the full timeline count (3,435 + 2,598 = 6,033 on the current snapshot). |
+| `producer/` — text window clipping | `.venv/bin/python producer/produce.py --dry-run` and read the `[producer] text` line — must read "117 of 1,347" (or whatever the current snapshot's counts are), never all 1,347. Confirms decades of pre-price-window press releases stay on disk and never reach Kafka. |
 | `producer/` — live pacing | `time .venv/bin/python producer/produce.py --mode live --dry-run --duration 4` — should take ~4s with the progress line advancing evenly, not in a burst. |
 | `scripts/verify_stack.sh` | `bash scripts/verify_stack.sh` — needs a running stack. Also `bash -n scripts/verify_stack.sh` for a syntax-only check. |
 | Infra — full live smoke test | `docker compose up -d && bash scripts/verify_stack.sh && docker compose run --rm producer && .venv/bin/python scripts/describe_topics.py --bootstrap localhost:29092` — brings up the whole stack, provisions topics, backfills a year, and prints message counts. |
@@ -1780,3 +1781,129 @@ written outside the repo.
 no `shares_outstanding` since the buyback work on 2026-08-11 and reports 6/7; the
 row now matches what the command actually prints, so a teammate running it does
 not read a correct result as a failure.
+
+### 2026-09-01 — Refreshed snapshots for the demo; Finnhub live producer MVP (Amir)
+
+**Snapshot refresh.** Re-ran all three fetch scripts (`fetch_historical_data.py`,
+`fetch_historical_filings.py`, `fetch_historical_text.py`) against live sources
+so the "live" simulation plays out over dates ending 2026-08-31 instead of a
+year-old cutoff. New totals: 5,000 price bars (unchanged shape, 500/ticker),
+916 filings (was 875 — EDGAR has filed more since the last pull), 1,347 8-K
+press releases (was 1,324). The producer's backfill/live split at "first price
+bar + 365 days" now falls on 2025-09-03 (was 2025-08-05): 3,435 backfilled
+(2,500 prices / 876 filings / 59 text), 2,598 live. Coincidence that the
+backfill total (3,435) landed on the exact same number as before — the
+per-topic breakdown shifted (filings +1, text -1) even though the sum did not.
+Verified with `produce.py --dry-run --validate-all`: contract self-check
+passes, 0 failures, all three schemas checked. Updated every stale count in
+README.md and RUNBOOK.md that named the old figures (`so_far.md`'s own log
+entries are left as a historical record of what was true on the date they were
+written, not corrected retroactively).
+
+**`producer/live_producer.py` — Finnhub WebSocket, MVP scope for ticket 0008.**
+Decided against building the full ticket (test fixture suite, `docs/DEMO.md`,
+`versions.md` updates, the `10s`/`30s` schema widening) given the one-week
+runway to the presentation; instead built the parts that can visibly break
+*during* a live demo:
+
+- Trade → bar aggregation (`BarAggregator`), tumbling per-symbol window keyed
+  on trade timestamp (not arrival order), open/close resolved by earliest/
+  latest timestamp, high/low/volume accumulated correctly.
+- Reconnect with exponential backoff (1s → 30s cap), re-subscribing on every
+  reconnect, backoff resetting after a connection actually holds — the process
+  never exits on a dropped socket.
+- Ctrl-C flushes in-flight windows via `SIGINT` and exits 0 through the same
+  `flush_and_summarise` the replay producer uses.
+- Missing `FINNHUB_API_KEY` and >50 symbols both exit non-zero before any
+  network activity, per the ticket's acceptance criteria.
+- Crypto symbol mode (`BINANCE:BTCUSDT`) for market-hours independence — the
+  ticket's core design constraint, since a morning presentation against
+  equities would connect cleanly and then sit in silence.
+- Reuses `producer/common.py` verbatim (producer factory, `BufferError` retry,
+  delivery tracking, schema validation) rather than reimplementing it, so the
+  Kafka-facing half is exercised by the same code already verified live in
+  `produce.py`.
+
+**Deliberately deferred, matching the frozen-contract rule in CLAUDE.md:**
+widening `market.prices.v1`'s `interval` enum to add `10s`/`30s` sub-minute
+bars. Bar interval is pinned to the existing `1m/5m/1h/1d` values instead. This
+is a schema change affecting Spark's `from_json` and the Elasticsearch mapping
+downstream — needs the team in the room, not a solo commit under deadline
+pressure, even though the ticket itself notes it would be a non-breaking widen.
+
+**Verified offline, no broker or real Finnhub key needed** (inline checks, not
+saved as a `tests/` file — that formal suite is exactly what MVP scope
+skipped): out-of-order trade arrival resolves `open`/`close` correctly by
+timestamp; a trade exactly on a window boundary closes the prior window and
+starts the next one; crypto symbol normalization (`BINANCE:BTCUSDT` →
+`BTCUSDT`) strips the exchange prefix before the ticker hits the wire; every
+emitted bar validates against `schemas/market.prices.v1.schema.json`; missing
+key and 51-symbol guardrails both exit 1 with the correct message before
+touching the network.
+
+**Not yet verified: an actual live connection.** No Finnhub key was available
+in this session (the user will add their own to `.env`). Before the demo,
+someone with a key needs to run both symbol modes at least once against a live
+broker and confirm bars actually land on `market.prices.v1` — the WebSocket
+plumbing itself (`websocket-client`, added to `producer/requirements.txt`) is
+untested beyond import.
+
+### 2026-09-03 — A "Refresh data" button in the dashboard sidebar (Amir)
+
+**What prompted it.** Demo rehearsal exposed a real gap: `producer-live`
+streams continuously into Kafka, but `spark/pipeline.py` is a one-shot batch
+read (`spark.read`, not `spark.readStream` — confirmed by grep, nothing in
+this codebase uses Structured Streaming), so nothing reaches Elasticsearch or
+the dashboard until someone manually re-runs the Spark job from a terminal.
+Converting the pipeline to genuine Structured Streaming was considered and
+rejected for this deadline: MLlib's `KMeans.fit()` needs a static DataFrame
+(the anomaly stage can't train on a live stream without splitting fit from
+score), and the LLM analyst stage would blow through Groq/Gemini's daily quota
+if triggered per micro-batch. A button that re-runs the existing batch job is
+the honest middle ground — it doesn't add streaming, it just removes the
+terminal round-trip.
+
+**How it works — Docker-out-of-Docker, not a nested Docker.** The dashboard
+container now mounts `/var/run/docker.sock` (confirmed to be a symlink to the
+real OrbStack socket on this machine, so the standard mount path works) and
+the repo bind-mounted at the *same absolute path* it lives at on the host
+(`${PWD}:${PWD}` in `docker-compose.yml`, with `PROJECT_DIR=${PWD}` passed as
+an env var so `app.py` knows where to `cwd` for the subprocess call). This
+matters because `docker compose`'s relative volume paths
+(`./historical_data:/snapshots:ro` etc.) are resolved by whichever daemon
+executes them against whatever directory the CLI was invoked from — since the
+socket points at the *host* daemon, running `docker compose` from inside this
+container only resolves those paths correctly if the container's view of the
+filesystem lines up byte-for-byte with the host's. Mounting the repo at an
+identical path is what makes that true; a mount to some other in-container
+path (e.g. `/app`) would have silently mounted the wrong directory in the new
+Spark container.
+
+`dashboard/Dockerfile` installs `docker-cli` + `docker-compose` (Debian
+trixie's own packages, 2.26.1 — confirmed *not* to need Docker's external apt
+repo, and confirmed to register as the `docker compose` subcommand, not the
+legacy hyphenated v1 binary, by test-building a throwaway container before
+touching the real Dockerfile). `app.py` gained a sidebar button that runs
+`docker compose --profile jobs run --rm spark` via `subprocess.run` inside an
+`st.status()` block, then `st.cache_data.clear()` + `st.rerun()` once it
+exits 0, so the whole page reflects new data immediately without a manual
+browser refresh.
+
+**Verified live**, in this order: test-installed `docker-cli`/`docker-compose`
+in a throwaway `python:3.11-slim` container first to confirm package
+availability and the `docker compose version` subcommand before writing the
+real Dockerfile change; rebuilt the dashboard image and confirmed from inside
+the running container that `docker version` reaches the host daemon and
+`$PROJECT_DIR/docker-compose.yml` resolves; ran the exact command manually
+inside the container to confirm the DooD path works end to end (full
+pipeline output, ES counts updated) *before* trusting the UI; then drove the
+actual button in a headless browser (Playwright) — confirmed the "RUNNING..."
+indicator, the `st.status` "Running Spark job..." box, and a clean return to
+normal state with no console errors, with no spark container left behind
+afterward (`--rm` cleans it up, confirmed via `docker ps -a`).
+
+**Known limitation, not fixed:** no debouncing — clicking the button twice in
+quick succession launches two concurrent `docker compose run` invocations.
+Harmless today (Spark's ES writes are idempotent upserts, so two concurrent
+runs just double the compute, not the data), but worth a `st.session_state`
+guard if this becomes a permanent feature rather than a demo aid.

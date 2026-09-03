@@ -9,3 +9,6 @@ pyarrow==16.1.0
 
 # Contract self-check against schemas/*.schema.json before producing.
 jsonschema==4.23.0
+
+# WebSocket client for the Finnhub live producer (live_producer.py).
+websocket-client==1.9.2
