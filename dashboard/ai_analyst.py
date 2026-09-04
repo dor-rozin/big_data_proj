@@ -121,7 +121,7 @@ def provider_config() -> dict:
     if provider == "gemini":
         key, model = _env("GEMINI_API_KEY"), _env("GEMINI_MODEL", "gemini-3.6-flash")
     elif provider == "groq":
-        key, model = _env("GROQ_API_KEY"), _env("GROQ_MODEL", "llama-3.3-70b-versatile")
+        key, model = _env("GROQ_API_KEY"), _env("GROQ_MODEL", "openai/gpt-oss-20b")
     else:
         return {"provider": provider, "model": None, "has_key": False,
                 "supported": False, "enabled": _flag("LLM_ENABLED", True)}

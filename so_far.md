@@ -2058,3 +2058,38 @@ with distinct ids.
 **Known, and deliberate:** Elasticsearch returns raw JSON with no stylesheet, so
 some browsers render it white-on-white. Nothing is wrong with the data — use a
 dark-mode browser, select the text, or add Kibana.
+
+### 2026-09-04 — The "Ask Our Home Analyst" button was hitting the retired Groq model (Amir)
+
+**Two separate causes, both now fixed.** After pinning `GROQ_MODEL` correctly
+in `.env` and verifying it against Spark, the dashboard's own on-demand
+analyst button (`dashboard/ai_analyst.py`, "Ask Our Home Analyst about
+{ticker}") still threw the exact same `model_not_found` on
+`llama-3.3-70b-versatile` from the 2026-09-04 entry above. Two independent
+reasons:
+
+1. **The dashboard container is long-running, not one-shot like Spark.** It
+   was started before `.env` got the `GROQ_MODEL` fix, and Docker Compose does
+   not hot-reload `env_file` into an already-running container — confirmed
+   with `docker compose exec dashboard sh -c 'echo $GROQ_MODEL'`, which
+   printed the stale value straight from the process environment.
+   `docker compose up -d --force-recreate dashboard` picks up the current
+   `.env`; a plain `docker compose up -d` does not, since compose's own
+   change-detection doesn't hash `env_file` contents.
+2. **A second, independent hardcoded fallback.** `ai_analyst.py:124` read
+   `_env("GROQ_MODEL", "llama-3.3-70b-versatile")` — its own copy of the now-
+   dead model name as the default if `GROQ_MODEL` is ever unset, unrelated to
+   `.env.example`'s default. Fixed to `openai/gpt-oss-20b`, matching the value
+   everywhere else. `grep -rl "llama-3.3-70b-versatile" **/*.py` confirmed no
+   other copies remain anywhere in the codebase.
+
+**Verified live**: rebuilt and recreated the dashboard container, clicked
+"Ask Our Home Analyst about AAPL" in a real browser, got back a BUY /
+Medium-confidence recommendation attributed to `openai/gpt-oss-20b via groq`,
+saved to `stock_analysis` as `AAPL|1d|2026-09-04|home_analyst`.
+
+**Lesson for next time a config value changes:** editing `.env` is not enough
+for any service running via `docker compose up -d` (dashboard, kafka-ui,
+kafka, elasticsearch) — only one-shot `docker compose run` jobs (producer,
+spark) read it fresh every time. Long-running services need an explicit
+`--force-recreate` (or `down` + `up`) to pick up a `.env` change.
