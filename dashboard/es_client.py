@@ -22,6 +22,7 @@ to tolerate that. `kpis._num()` is the counterpart that does.
 from __future__ import annotations
 
 import os
+from datetime import date
 
 import pandas as pd
 from elasticsearch import Elasticsearch
@@ -134,7 +135,8 @@ def fetch_prices(es: Elasticsearch, ticker: str,
     return df
 
 
-def fetch_latest_analysis(es: Elasticsearch, ticker: str) -> dict | None:
+def fetch_latest_analysis(es: Elasticsearch, ticker: str,
+                          source: str | None = None) -> dict | None:
     """The most recent LLM analyst note produced by the Spark stage, if any.
 
     Returns None when the analyst stage was skipped (no API key, or
@@ -147,9 +149,14 @@ def fetch_latest_analysis(es: Elasticsearch, ticker: str) -> dict | None:
     """
     if not es.indices.exists(index=ANALYSIS_INDEX):
         return None
+    must = [{"term": {"ticker": ticker}}]
+    if source:
+        # Two analysts write to this index. Without filtering, a panel would
+        # happily render the other one's note as its own.
+        must.append({"term": {"source": source}})
     resp = es.search(
         index=ANALYSIS_INDEX, size=1,
-        query={"term": {"ticker": ticker}},
+        query={"bool": {"filter": must}},
         sort=[{"as_of": {"order": "desc"}}],
     )
     hits = resp["hits"]["hits"]
@@ -172,3 +179,77 @@ def fetch_latest_context(es: Elasticsearch, ticker: str) -> dict | None:
     )
     hits = resp["hits"]["hits"]
     return hits[0]["_source"] if hits else None
+
+
+# ---------------------------------------------------------------------------
+# Writing back
+# ---------------------------------------------------------------------------
+# The only write in this module. Everything else here reads, because the Spark
+# job owned every index until the analyst stage moved to being on demand — a
+# note is now produced when a reader asks for one, and it has to survive the
+# browser session that asked.
+ANALYSIS_MAPPING = {
+    "properties": {
+        "ticker": {"type": "keyword"},
+        "interval": {"type": "keyword"},
+        "as_of": {"type": "date"},
+        "recommendation": {"type": "keyword"},
+        "confidence": {"type": "keyword"},
+        "provider_used": {"type": "keyword"},
+        "model_used": {"type": "keyword"},
+        # Which path produced this note. The Spark batch stage and this
+        # dashboard reason over different evidence — prices plus anomalies plus
+        # filing text there, the seven fundamentals plus an anomaly summary here
+        # — so a reader comparing two notes needs to know which is which.
+        "source": {"type": "keyword"},
+        # The reader's emphasis, when one was given. A note shown without the
+        # instruction that shaped it is not reproducible.
+        "focus_used": {"type": "text"},
+        "key_risks": {"type": "text"},
+        "signals": {"type": "text"},
+        "summary": {"type": "text"},
+        "error": {"type": "keyword"},
+    }
+}
+
+
+def write_analysis(es: Elasticsearch, ticker: str, parsed: dict,
+                   provider: str, model: str, interval: str = "1d",
+                   source: str = "dashboard") -> str:
+    """Store one analyst note, keyed exactly as the Spark stage keys its own.
+
+    Keyed `ticker|interval|as_of|source`. The source is part of the id because
+    two analysts now write here over different evidence -- the fundamentals
+    panel and the anomaly panel -- and without it the second click of the day
+    would overwrite the first analyst's note with the other's. Asking the SAME
+    analyst twice in a day still overwrites, which is what you want.
+
+    Returns the document id. Raises whatever Elasticsearch raises: a failed
+    write must not be reported to the reader as a successful one.
+    """
+    as_of = date.today().isoformat()
+    doc = {
+        "ticker": ticker,
+        "interval": interval,
+        "as_of": as_of,
+        "source": source,
+        "provider_used": provider,
+        "model_used": model,
+        "recommendation": parsed.get("recommendation"),
+        "confidence": parsed.get("confidence"),
+        "key_risks": parsed.get("key_risks") or [],
+        "signals": parsed.get("signals") or [],
+        "summary": parsed.get("summary"),
+    }
+    if parsed.get("focus_used"):
+        doc["focus_used"] = parsed["focus_used"]
+    # Drop empties rather than storing explicit nulls, matching how the Spark
+    # writer treats a missing value.
+    doc = {k: v for k, v in doc.items() if v not in (None, "", [])}
+
+    if not es.indices.exists(index=ANALYSIS_INDEX):
+        es.indices.create(index=ANALYSIS_INDEX, mappings=ANALYSIS_MAPPING)
+
+    doc_id = f"{ticker}|{interval}|{as_of}|{source}"
+    es.index(index=ANALYSIS_INDEX, id=doc_id, document=doc, refresh=True)
+    return doc_id

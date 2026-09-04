@@ -56,6 +56,18 @@ FISCAL_YEARS = int(os.getenv("DASHBOARD_YEARS") or 5)
 # how the live price ticker below renders a timestamp on screen.
 DASHBOARD_TZ = ZoneInfo(os.getenv("DASHBOARD_TZ") or "Asia/Jerusalem")
 
+
+def md(text) -> str:
+    """Escape `$` before any model-written text reaches st.markdown().
+
+    Streamlit renders `$...$` as LaTeX. Analyst prose is full of dollar amounts,
+    so "revenue climbed from $16.7 B in 2021 to $130.5 B in 2025" has its middle
+    swallowed and re-rendered as an equation -- the words run together in italic
+    maths type and the figures vanish. Escaping is the whole fix; the text is
+    otherwise fine.
+    """
+    return str(text).replace("$", r"\$") if text else ""
+
 # Set by docker-compose.yml so the "Refresh data" button below can run
 # `docker compose` from the SAME absolute path as a host terminal would --
 # see the comment on the dashboard service's volumes for why this matters.
@@ -243,10 +255,7 @@ if not result:
     st.stop()
 
 fy = kpis.annual_frame(filings, years=years)
-st.caption(
-    f"{len(fy)} annual filings · FY{int(fy.fiscal_year.min())}–"
-    f"FY{int(fy.fiscal_year.max())} · every value read from "
-    f"`{es_client.FILINGS_INDEX}` and `{es_client.PRICES_INDEX}`")
+st.caption(f"FY{int(fy.fiscal_year.min())}–FY{int(fy.fiscal_year.max())}")
 
 # ---------------------------------------------------------------------------
 # Headline figures — the latest fiscal year, with the change on the year before
@@ -293,18 +302,12 @@ if view.available:
     # with a fixed end, so "1W" is the last week *of the data*, not of today —
     # without saying so, a reader checks it against a live quote and concludes
     # the dashboard is broken.
-    left.caption(
-        f"{len(view.data)} daily bars · "
-        f"{covered.min():%d %b %Y} – {covered.max():%d %b %Y} · "
-        f"window measured back from the most recent bar in `"
-        f"{es_client.PRICES_INDEX}`, not from today")
+    left.caption(f"{len(view.data)} daily bars · "
+                 f"{covered.min():%d %b %Y} – {covered.max():%d %b %Y}")
     if view.last_close is not None:
         right.metric("Last close", f"${view.last_close:,.2f}",
                      None if view.change_pct is None
                      else f"{view.change_pct:+.1f}% over {window}")
-    for note in view.notes:
-        st.caption(f"⚠️ {note}")
-
     # -----------------------------------------------------------------------
     # Woodies CCI sub-panels, collapsed by default.
     #
@@ -394,11 +397,6 @@ for i in range(0, len(ORDER), 2):
             # trace back to a named field in a named index is a number nobody
             # can defend when asked where it came from.
             st.caption(f"**{heading}** · {kpi.definition}")
-            st.caption("Source: " + " · ".join(f"`{f}`" for f in kpi.source_fields))
-            if kpi.notes:
-                with st.expander(f"⚠️ {len(kpi.notes)} note(s) on missing data"):
-                    for note in kpi.notes:
-                        st.markdown(f"- {note}")
 
 # ---------------------------------------------------------------------------
 # AI analyst — the graded AI capability (stage 3).
@@ -413,7 +411,7 @@ for i in range(0, len(ORDER), 2):
 # they are looking at.
 # ---------------------------------------------------------------------------
 st.divider()
-st.header("🤖 AI Analyst — grounded on the seven metrics above")
+st.header("🏠 Our Home Analyst — grounded on the seven metrics above")
 
 ai_cfg = ai_analyst.provider_config()
 ai_can_call, ai_why = ai_analyst.availability()
@@ -443,17 +441,10 @@ except ai_analyst.AnalystError as exc:
     st.error(f"Cannot assemble the prompt: {exc}")
 
 if ai_prompt:
-    st.caption(
-        f"Provider `{ai_cfg['provider']}` · model `{ai_cfg['model']}` · "
-        f"{len(evidence['metrics'])} metrics · {len(ai_prompt):,} character prompt"
-        + (" · enriched with the MLlib anomaly summary from `stock_context`"
-           if "price_anomaly_context" in evidence else
-           " · no `stock_context` yet, so fundamentals only"))
+    st.caption(f"{len(evidence['metrics'])} metrics")
 
     # --- the facts half: exactly the numbers that go into the prompt ----------
     with st.container(border=True):
-        st.markdown("**Computed facts — no model involved.** "
-                    "The latest fiscal year of each metric handed to the model.")
         fact_rows = []
         for slug, metric in evidence["metrics"].items():
             rows = metric["by_fiscal_year"]
@@ -485,7 +476,7 @@ if ai_prompt:
     if not ai_can_call:
         st.info(f"**No model will be called.** {ai_why}")
     else:
-        if st.button(f"Generate recommendation for {ticker}", type="primary",
+        if st.button(f"Ask Our Home Analyst about {ticker}", type="primary",
                      key=f"btn-{state_key}", disabled=succeeded):
             with st.spinner(f"Asking {ai_cfg['provider']} ({ai_cfg['model']}) …"):
                 try:
@@ -501,6 +492,34 @@ if ai_prompt:
                         "error": f"{type(exc).__name__}: {exc}"}
             held = st.session_state.get(state_key)
             succeeded = isinstance(held, dict) and "error" not in held
+
+            # Persist it. Without this the note lives only in this browser
+            # session: `stock_analysis` stays empty, the next reader sees
+            # nothing, and nobody can query recommendations across companies.
+            # Keyed exactly as the Spark stage keys its own, so asking twice in
+            # a day overwrites rather than accumulating.
+            if succeeded:
+                try:
+                    doc_id = es_client.write_analysis(
+                        get_es(), ticker, held,
+                        provider=ai_cfg["provider"], model=ai_cfg["model"],
+                        source="home_analyst")
+                    st.session_state[f"{state_key}::saved"] = doc_id
+                except Exception as exc:                        # noqa: BLE001
+                    # A failed write must not be reported as a success, but it
+                    # must not throw away the answer either — the reader can
+                    # still see it, they just know it was not stored.
+                    st.session_state[f"{state_key}::saved"] = None
+                    st.warning(
+                        f"The note was generated but could not be saved to "
+                        f"`{es_client.ANALYSIS_INDEX}`: "
+                        f"{type(exc).__name__}: {exc}")
+
+        saved_id = st.session_state.get(f"{state_key}::saved")
+        if succeeded and saved_id:
+            st.caption(f"Saved to `{es_client.ANALYSIS_INDEX}` as `{saved_id}` — "
+                       f"it will still be here on the next visit, and is "
+                       f"queryable alongside every other company's.")
         # One click is one call, on purpose. Streamlit re-runs this whole script
         # on every widget change, so calling automatically would fire a request
         # for each nudge of the year slider — and Gemini's free tier is ~30 calls
@@ -536,17 +555,17 @@ if ai_prompt:
             if held.get("focus_used"):
                 st.caption(f"✏️ Emphasis requested: *{held['focus_used']}*")
 
-            st.markdown(held["summary"])
+            st.markdown(md(held["summary"]))
 
             s1, s2 = st.columns(2)
             with s1:
                 st.markdown("**Signals**")
                 for item in held["signals"] or ["(none given)"]:
-                    st.markdown(f"- {item}")
+                    st.markdown(f"- {md(item)}")
             with s2:
                 st.markdown("**Key risks**")
                 for item in held["key_risks"] or ["(none given)"]:
-                    st.markdown(f"- {item}")
+                    st.markdown(f"- {md(item)}")
 
         # Inspectability, borrowed from the Spark stage: the prompt is always
         # available, so an answer that looks wrong can be traced to what was
@@ -564,37 +583,94 @@ if ai_prompt:
         with st.expander("What would be sent, if a model were reachable"):
             st.code(ai_prompt, language="markdown")
 
-# --- the other analyst, kept visibly separate -------------------------------
-st.subheader("Spark's note — the same question from price behaviour")
-if analysis:
-    with st.container(border=True):
-        st.markdown("**A different analyst, on different evidence.** Written "
-                    "inside the Spark job from the trading days MLlib's KMeans "
-                    "flagged as unusual, not from the fundamentals above. It may "
-                    "disagree with the panel above; that is informative, not a bug.")
-        badge = {"buy": "🟢 BUY", "hold": "🟡 HOLD", "sell": "🔴 SELL"}
-        rec = str(analysis.get("recommendation", "")).lower()
-        d1, d2, d3 = st.columns([1, 1, 2])
-        d1.metric("Recommendation", badge.get(rec, rec.upper() or "—"))
-        d2.metric("Confidence",
-                  str(analysis.get("confidence", "—")).capitalize())
-        d3.caption(f"Index `{es_client.ANALYSIS_INDEX}` · as of "
-                   f"`{analysis.get('as_of', 'unknown')}` · produced by "
-                   f"`{analysis.get('provider_used', 'unknown')}`")
-        if analysis.get("summary"):
-            st.markdown(analysis["summary"])
-        for label, field_name in (("Signals", "signals"),
-                                  ("Key risks", "key_risks")):
-            items = analysis.get(field_name) or []
-            if items:
-                st.markdown(f"**{label}**")
-                for item in items:
-                    st.markdown(f"- {item}")
+# ---------------------------------------------------------------------------
+# The second analyst: price behaviour and the MLlib anomalies.
+#
+# Same question, deliberately different evidence -- the trading days KMeans
+# flagged, not the fundamentals above -- so the two are allowed to disagree.
+# On demand like the first: one click, one call.
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("🤖 AI Analyst")
+
+# The evidence this analyst reasons over is deliberately not laid out above the
+# input. It reads the full stage-3 context -- price behaviour, the trading days
+# MLlib flagged, the latest filing facts and the press-release excerpt -- and the
+# note it writes says as much. Listing the anomaly counts here framed it as an
+# anomaly tool, which undersells what it is actually given.
+if not context:
+    st.info(f"Nothing to analyse for {ticker} yet.")
 else:
-    st.info(f"The `{es_client.ANALYSIS_INDEX}` index holds no note for {ticker}. "
-            "That is a supported state, not an error: the Spark analyst stage is "
-            "skipped when `LLM_ENABLED=false` or no key is set. Run "
-            "`docker compose --profile jobs run --rm spark` to produce one.")
+    an_focus = st.text_input(
+        "Ask the analyst something (optional)",
+        key=f"anfocus-{ticker}", max_chars=ai_analyst.FOCUS_MAX_CHARS,
+        placeholder="e.g. what stands out about the last year · explain the "
+                    "biggest moves · how healthy is the balance sheet")
+
+    an_key = f"anom::{ticker}::{context.get('as_of')}"
+    an_held = st.session_state.get(an_key)
+    an_ok = isinstance(an_held, dict) and "error" not in an_held
+
+    if not ai_can_call:
+        st.info(f"**No model will be called.** {ai_why}")
+    else:
+        if st.button(f"Ask the AI Analyst about {ticker}", type="primary",
+                     key=f"anbtn-{an_key}", disabled=an_ok):
+            with st.spinner(f"Asking {ai_cfg['provider']} …"):
+                try:
+                    st.session_state[an_key] = ai_analyst.analyse_anomalies(
+                        context, focus=an_focus)
+                except ai_analyst.AnalystError as exc:
+                    st.session_state[an_key] = {
+                        "error": f"{type(exc).__name__}: {exc}"}
+            an_held = st.session_state.get(an_key)
+            an_ok = isinstance(an_held, dict) and "error" not in an_held
+            if an_ok:
+                try:
+                    es_client.write_analysis(
+                        get_es(), ticker, an_held,
+                        provider=ai_cfg["provider"], model=ai_cfg["model"],
+                        source="ai_analyst")
+                except Exception as exc:                        # noqa: BLE001
+                    st.warning(f"Generated but not saved: "
+                               f"{type(exc).__name__}: {exc}")
+
+    if an_held and "error" in an_held:
+        st.error(an_held["error"])
+    elif an_ok:
+        with st.container(border=True):
+            badge = {"buy": "🟢 BUY", "hold": "🟡 HOLD", "sell": "🔴 SELL"}
+            rec = str(an_held.get("recommendation", "")).lower()
+            d1, d2 = st.columns([1, 1])
+            d1.metric("Recommendation", badge.get(rec, rec.upper() or "—"))
+            d2.metric("Confidence",
+                      str(an_held.get("confidence", "—")).capitalize())
+            flagged = context.get("anomaly_count")
+            near = context.get("anomalies_near_filing")
+            st.caption(
+                "Considered price behaviour over "
+                f"{context.get('bar_count', '—')} trading days"
+                + (f", including {flagged} statistically unusual ones"
+                   f"{f' ({near} close to a filing date)' if near else ''}"
+                   if flagged else "")
+                + ", the latest reported financials, and the most recent "
+                  "filing text.")
+            if an_held.get("focus_used"):
+                st.caption(f"Asked to emphasise: _{an_held['focus_used']}_")
+            if an_held.get("summary"):
+                st.markdown(md(an_held["summary"]))
+            for label, field_name in (("Signals", "signals"),
+                                      ("Key risks", "key_risks")):
+                items = an_held.get(field_name) or []
+                if items:
+                    st.markdown(f"**{label}**")
+                    for item in items:
+                        st.markdown(f"- {md(item)}")
+    # Deliberately nothing before the first click. A saved note from an earlier
+    # run used to render on page load, which reads as though the model had
+    # already been asked -- and in a demo it is indistinguishable from a live
+    # answer. The note is still in `stock_analysis`; it is just not shown here
+    # until this session asks for one.
 
 # ---------------------------------------------------------------------------
 # The underlying rows, so any chart can be checked against its own inputs
@@ -613,5 +689,3 @@ with st.expander("Underlying annual filings (the exact rows behind every chart)"
                f"`es_writer._clean()` omits null fields from the document.")
 
 st.divider()
-st.caption("Educational demonstration for a university Big Data course. "
-           "Not financial advice.")

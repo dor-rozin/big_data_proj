@@ -72,6 +72,17 @@ MAX_CONSECUTIVE_FAILURES = 2
 RETRIES_WITH_FALLBACK = 2
 RETRIES_LAST_RESORT = 5
 
+# Attempts at the SAME provider when the transport succeeded but the reply did
+# not satisfy the JSON contract — a missing key, a bad enum, unparseable text.
+#
+# Different from a transport retry: the provider is healthy, the model just
+# produced a malformed answer, and that is stochastic. Asking the same model
+# again usually gets a well-formed reply, whereas falling straight through to
+# the fallback spends a second provider's budget on a problem the first one
+# would have fixed for free. Observed on gpt-oss-20b, which dropped `signals`
+# and `summary` on roughly one instrument in ten.
+PARSE_ATTEMPTS = 2
+
 
 class GeminiError(RuntimeError):
     """A call failed. Retrying the same provider may still be worthwhile."""
@@ -531,14 +542,26 @@ def analyse_rows(rows, prompt_template, providers, max_calls=0,
                 has_fallback = any(q["name"] not in dead
                                    for q in providers[idx + 1:])
             try:
-                raw = call_llm(prompt, p["model"], p.get("api_key", ""),
-                               provider=name, pacer=pacers[name],
-                               timeout=p.get("timeout", 90),
-                               base_url=p.get("base_url"),
-                               max_retries=(RETRIES_WITH_FALLBACK if has_fallback
-                                            else RETRIES_LAST_RESORT),
-                               label=f"{ticker} [{name}]: ")
-                parsed = parse_analysis(raw)
+                parsed = None
+                for attempt in range(PARSE_ATTEMPTS):
+                    raw = call_llm(prompt, p["model"], p.get("api_key", ""),
+                                   provider=name, pacer=pacers[name],
+                                   timeout=p.get("timeout", 90),
+                                   base_url=p.get("base_url"),
+                                   max_retries=(RETRIES_WITH_FALLBACK if has_fallback
+                                                else RETRIES_LAST_RESORT),
+                                   label=f"{ticker} [{name}]: ")
+                    try:
+                        parsed = parse_analysis(raw)
+                        break
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        # Malformed reply from a healthy provider. Retry the same
+                        # model before spending the fallback's budget.
+                        if attempt == PARSE_ATTEMPTS - 1:
+                            raise
+                        print(f"[llm] {ticker} [{name}]: malformed reply "
+                              f"({exc}); retrying same model "
+                              f"({attempt + 2}/{PARSE_ATTEMPTS})", flush=True)
                 with lock:
                     streak[name] = 0
                     done[0] += 1
