@@ -32,6 +32,7 @@ the business and a gap is a claim about the filing.
 import hashlib
 import os
 import subprocess
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -40,13 +41,20 @@ import ai_analyst
 import charts
 import es_client
 import indicators
+import kafka_tail
 import kpis
 import woodies_chart
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Financial KPIs & AI Analyst",
                    page_icon="📊", layout="wide")
 
 FISCAL_YEARS = int(os.getenv("DASHBOARD_YEARS") or 5)
+
+# Display-only: every `ts`/`ingested_at` on the wire and in Elasticsearch stays
+# UTC, per the frozen schema contract (schemas/README.md) -- this only affects
+# how the live price ticker below renders a timestamp on screen.
+DASHBOARD_TZ = ZoneInfo(os.getenv("DASHBOARD_TZ") or "Asia/Jerusalem")
 
 # Set by docker-compose.yml so the "Refresh data" button below can run
 # `docker compose` from the SAME absolute path as a host terminal would --
@@ -112,6 +120,16 @@ def load_company(ticker: str):
             es_client.fetch_latest_context(es, ticker))
 
 
+@st.cache_resource
+def get_kafka_tail():
+    """One background consumer thread per Streamlit server process (not per
+    session/browser tab) -- see kafka_tail.py for why this reads Kafka
+    directly instead of going through Elasticsearch/Spark like everything
+    else on this page."""
+    bootstrap = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+    return kafka_tail.start(bootstrap)
+
+
 # ---------------------------------------------------------------------------
 # Sidebar — connection state first, because an empty chart is almost always a
 # stage that has not been run rather than a company with no data.
@@ -174,6 +192,19 @@ ticker = st.sidebar.selectbox("Company", tickers,
                               index=tickers.index("AAPL") if "AAPL" in tickers else 0)
 years = st.sidebar.slider("Fiscal years", 3, 8, FISCAL_YEARS)
 
+st.sidebar.divider()
+live_tick_on = st.sidebar.checkbox("Live price ticker", value=False,
+                                   help="Reads market.prices.v1 directly from "
+                                        "Kafka via a background consumer -- "
+                                        "bypasses Elasticsearch and Spark "
+                                        "entirely, so it reflects a bar within "
+                                        "seconds of it being produced, not just "
+                                        "after the next Refresh data run. Only "
+                                        "sees bars produced AFTER the dashboard "
+                                        "container started (no history replay).")
+live_tick_seconds = st.sidebar.slider("Refresh every (s)", 1, 30, 3,
+                                      disabled=not live_tick_on)
+
 # ---------------------------------------------------------------------------
 # Compute
 # ---------------------------------------------------------------------------
@@ -181,6 +212,29 @@ filings, prices, analysis, context = load_company(ticker)
 result = kpis.compute_all(filings, prices, years=years)
 
 st.title(f"{ticker} — Financial KPIs")
+
+if live_tick_on:
+    st_autorefresh(interval=live_tick_seconds * 1000, key="live_tick_autorefresh")
+    tick = get_kafka_tail().get(ticker)
+    if tick is None:
+        st.info(f"No bar received for {ticker} on Kafka yet since this dashboard "
+                f"started. Start a producer (e.g. `producer/live_producer.py` or "
+                f"`--mode live`) and the first completed bar will appear here "
+                f"within seconds -- no Spark run needed.")
+    else:
+        age_s = (pd.Timestamp.now(tz="UTC")
+                 - pd.Timestamp(tick["ingested_at"], tz="UTC")).total_seconds()
+        bar_start_local = (pd.Timestamp(tick["ts"], tz="UTC")
+                           .tz_convert(DASHBOARD_TZ).strftime("%H:%M"))
+        cols = st.columns(4)
+        cols[0].metric("Latest price", f"${tick['close']:,.2f}")
+        cols[1].metric("Bar", tick["interval"])
+        cols[2].metric(f"Bar start ({DASHBOARD_TZ.key})", bar_start_local)
+        cols[3].metric("Produced", f"{age_s:,.0f}s ago")
+        st.caption(
+            "Read directly off Kafka's `market.prices.v1` by a background "
+            "consumer -- no Elasticsearch, no Spark run, in this widget's path.")
+    st.divider()
 
 if not result:
     st.warning(f"No annual (FY) filings found for {ticker}. The seven charts are "

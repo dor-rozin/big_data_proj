@@ -273,6 +273,29 @@ syncs the batch layer to whatever the producer has already sent. Only works
 when the dashboard is started via `docker compose up` (needs the socket mount
 and `PROJECT_DIR` env var); a bare `streamlit run app.py` disables it.
 
+### The "Live price ticker"
+
+A separate sidebar checkbox shows a small live-updating price readout that
+deliberately bypasses Elasticsearch and Spark entirely — `dashboard/kafka_tail.py`
+runs a background consumer (started once per Streamlit server process, not per
+browser tab) that tails `market.prices.v1` directly from `auto.offset.reset:
+latest`, so it only sees bars produced after the dashboard container started —
+no replay of the historical backlog. Turning it on reruns the page on a timer
+(`streamlit-autorefresh`) and reads whatever the consumer's in-memory
+`{ticker: latest_bar}` map currently holds. This is the one place in the
+dashboard that shows a bar within seconds of it landing on Kafka: the
+"Refresh data" button above it is still the only way to get *new* data into
+Elasticsearch (and therefore into the KPI charts and price chart), since
+those views are deliberately Spark-only.
+
+The bar-start time shown here is converted to `DASHBOARD_TZ` (`.env`, default
+`Asia/Jerusalem`) for display only — every `ts`/`ingested_at` on the wire, in
+Kafka, and in Elasticsearch stays UTC everywhere else, per the frozen schema
+contract. This is separate from, and not to be confused with, the timestamp
+kafka-ui shows next to each message: that is Kafka's own record-level
+`CreateTime` metadata (rendered by kafka-ui in your browser's local time as
+that tool's own display choice), not the `ts` field inside the JSON payload.
+
 The share-price chart carries a vertical crosshair. It follows the cursor
 anywhere in the panel — not only along the line — and snaps to trading days,
 reading out that day's date and close. Weekends and market holidays are

@@ -2,3 +2,7 @@ streamlit==1.36.0
 elasticsearch==8.13.1
 pandas==2.2.2
 plotly==5.22.0
+streamlit-autorefresh==1.0.1
+
+# Live price ticker: tails market.prices.v1 directly, bypassing Spark/ES.
+confluent-kafka==2.5.3

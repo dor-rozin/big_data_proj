@@ -14,7 +14,7 @@ To actually run the thing end to end with validation at every step, use
 | `producer/live_producer.py` — Finnhub live trades → bars (ticket 0008 MVP) | Amir | Code written, not verified live | Built 2026-09-01: trade→bar aggregation, reconnect/backoff, Ctrl-C flush, crypto symbol mode for market-hours independence. Unit-verified offline (out-of-order trades, window-boundary correctness, schema validation, missing-key / 51-symbol guardrails) — no real Finnhub key or live broker run yet. Bar interval pinned to the existing `1m/5m/1h/1d` enum; the ticket's `10s`/`30s` schema widening deliberately deferred (frozen contract, needs the team). No `tests/` fixture suite or doc updates beyond a README section — full ticket scope (0008) not attempted, by design given the one-week deadline |
 | Infra — topic provisioning (ticket 0003) | Amir | Runs end-to-end | `create_topics.py` + `describe_topics.py` verified live: idempotent, drift detection, correct partition/retention config. Makefile wrapper from ticket scope not yet written |
 | `spark/` — transform + KMeans + LLM analyst + ES load | Dor | Runs end-to-end | Verified live 2026-08-05 against a running stack: 2,500 bars + 875 filings + 1 text doc → 130 anomalies → 10 analyst notes → **4** ES indices (`stock_prices`, `stock_filings`, `stock_context`, `stock_analysis`). Re-run is idempotent. Not yet re-verified against the real `sec.text.v1` producer output (2026-08-06). No automated tests yet |
-| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart. Price chart gained a snapping vertical crosshair and a gap-collapsed time axis 2026-09-01. Sidebar "Refresh data" button added 2026-09-03 (Docker-out-of-Docker re-run of the Spark job from the browser) — verified live |
+| `dashboard/` — Streamlit | Ohad | Runs end-to-end | 5 modules + 7 fundamentals charts + a fundamentals-based AI analyst (separate from the Spark one). Verified 2026-08-25 against populated indices: serves 200, all four indices read. Woodies CCI/Stoch/MACD sub-panels added under the price chart. Price chart gained a snapping vertical crosshair and a gap-collapsed time axis 2026-09-01. Sidebar "Refresh data" button added 2026-09-03 (Docker-out-of-Docker re-run of the Spark job from the browser) — verified live. Same day: a "Live price ticker" added, reading `market.prices.v1` directly via a background Kafka consumer (`dashboard/kafka_tail.py`), bypassing Elasticsearch/Spark entirely — verified live, updates within seconds of a real Finnhub trade |
 | AI capability — dashboard-side analyst | Vilan | Code written, not verified | Built 2026-08-11: `dashboard/ai_analyst.py` + `prompts/analyst_fundamentals.md`, rendered by an AI panel in `app.py`. BUY/HOLD/SELL grounded on the 7 computed KPIs, separate from Spark's `stock_analysis`. Evidence and prompt verified offline for all 10 tickers, and one live Gemini call passed the contract — but **the panel has never rendered in a browser**, because that needs populated indices and no Spark run has happened on this machine yet |
 | `schemas/` — Kafka message contract (tickets 0001, 0010) | Amir | Done | 3 topics frozen, samples from real data, validator passing |
 | `sec.text.v1` — unstructured text producer (ticket 0010) | Amir | Runs end-to-end | `scripts/fetch_historical_text.py` + `produce.py` verified live 2026-08-06: 3,435/3,435 delivered with 0 failures on `--mode backfill`, incl. `sec.text.v1`. Joins `sec.filings.v1` by `cik` + `filed_date` window, **never** `accession_no` (0 shared accessions — contract corrected 2026-08-06, see log) |
@@ -1907,3 +1907,70 @@ quick succession launches two concurrent `docker compose run` invocations.
 Harmless today (Spark's ES writes are idempotent upserts, so two concurrent
 runs just double the compute, not the data), but worth a `st.session_state`
 guard if this becomes a permanent feature rather than a demo aid.
+
+### 2026-09-03 — A live price ticker that bypasses Spark/ES entirely (Amir)
+
+**Why the first attempt was wrong.** Built a "live tick" widget backed by
+`es_client.fetch_latest_tick` (query `stock_prices` sorted by `ts` desc, no
+interval filter) plus `streamlit-autorefresh` polling it every few seconds.
+It worked in the sense that it rendered a price — but `es_client.py` is
+read-only by its own module docstring, and `stock_prices` is written *only*
+by `spark/es_writer.py`. Polling Elasticsearch on a timer does not make data
+arrive in Elasticsearch faster; it just re-reads whatever the last Spark run
+happened to write. Caught this by cross-checking the widget's displayed
+timestamp against a direct `curl` to Elasticsearch and a live Finnhub stream
+run moments earlier — the widget was showing a bar over ten minutes stale
+while claiming to be live, because no Spark run had happened in between.
+Original caption in the UI even said "no Spark step in between," which was
+backwards: correct, but misleadingly incomplete — reworded before this was
+caught by anyone but a live cross-check.
+
+**The fix: read Kafka directly.** New `dashboard/kafka_tail.py` — one
+background consumer thread per Streamlit *server process* (via
+`st.cache_resource`, so it survives page reruns and isn't duplicated per
+browser tab), subscribed to `market.prices.v1` with
+`auto.offset.reset: latest` and a random, uncommitted `group.id` per process.
+Keeps an in-memory `{ticker: latest_bar}` dict behind a lock, updated as
+messages arrive. The widget just reads that dict — no Elasticsearch call, no
+Spark run, in its path at all. `confluent-kafka` added to
+`dashboard/requirements.txt` (same pinned version producer/ already uses;
+installed cleanly, no new system packages needed beyond what `python:3.11-slim`
+already had).
+
+**Deliberate scope limit:** `latest`, not `earliest` — the consumer only sees
+bars produced *after* the dashboard container started, never replays the
+historical backlog (which would be 5,000+ messages just for prices). Enabling
+the widget before starting a producer and watching the number populate live
+is the intended demo flow; enabling it after a producer has been streaming a
+while correctly shows "waiting" until the next bar completes, rather than
+silently backfilling from history the way `fetch_prices` does for the daily
+chart.
+
+**Verified live, the right way this time:** loaded the dashboard, enabled the
+widget, confirmed the "no bar received yet" state, *then* ran
+`producer/live_producer.py --symbols AAPL --duration 80` against a real
+Finnhub connection during market hours, and watched a fresh page load report
+"$327.78 · 1m · 17:29 · 14s ago" — while `stock_prices`' doc count in the
+sidebar (read from Elasticsearch, a completely different code path) stayed
+unchanged at 5,045, positive confirmation the two paths are actually
+independent, not just independently coded.
+
+**Known limitation, not fixed:** the consumer thread has no shutdown hook —
+it runs until the container stops. Harmless for a `daemon=True` thread in a
+single-process container, but if this dashboard ever runs multiple Streamlit
+server processes behind a load balancer, each would open its own Kafka
+consumer group, which is fine for read fan-out but worth knowing about before
+scaling this beyond a single-container demo.
+
+### 2026-09-04 — Found: `LLM_PROVIDER` defaults differently in two places (Amir)
+
+**Not fixed in code, worked around locally.** `spark/pipeline.py` reads
+`_env("LLM_PROVIDER", "groq")`; `dashboard/ai_analyst.py` reads
+`_env("LLM_PROVIDER", "gemini")` — same variable name, different fallback
+when it's unset. Found while checking why the dashboard's own AI panel and
+Spark's "note" section disagreed on provider with no `LLM_PROVIDER` set in
+`.env` at the time (left unset after the Ollama trial run). Worked around by
+pinning `LLM_PROVIDER=groq` explicitly in `.env` rather than relying on
+either default. The real fix is making `ai_analyst.py`'s default match
+`pipeline.py`'s (or vice versa) — belongs to Vilan's file, flagging here
+rather than changing it unreviewed.
